@@ -37,6 +37,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.deepseek_v4.attention import DeepseekV4IndexerCache
 from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
+from vllm.triton_utils import HAS_TRITON
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.models.deepseek_v4.compressor import AscendCompressorMetadata, Compressor
@@ -45,9 +46,42 @@ from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (
     AscendDeviceType,
+    enable_dsa_cp,
     get_ascend_device_type,
     npu_stream_switch,
 )
+
+if HAS_TRITON:
+    from vllm_ascend.ops.triton.indexer_block_topk import (
+        indexer_c4_score_topk,
+    )
+    from vllm_ascend.ops.triton.indexer_mxfp4_qk import (
+        create_e2m1_half_unit_lut,
+        mxfp4_indexer_paged_qk_matmul,
+    )
+else:
+    create_e2m1_half_unit_lut = None  # type: ignore
+    indexer_c4_score_topk = None  # type: ignore
+    mxfp4_indexer_paged_qk_matmul = None  # type: ignore
+
+
+MXFP4_INDEXER_HEAD_DIM = 128
+MXFP4_INDEXER_PACKED_HEAD_DIM = MXFP4_INDEXER_HEAD_DIM // 2
+MXFP4_INDEXER_SCALE_DIM = MXFP4_INDEXER_HEAD_DIM // 32
+MXFP4_INDEXER_CACHE_DTYPE_STR = "mxfp4"
+
+
+def _use_mxfp4_indexer(compress_ratio: int, head_dim: int) -> bool:
+    """Whether this Indexer instance can use the Triton MXFP4 path."""
+    return (
+        HAS_TRITON
+        and get_ascend_device_type() == AscendDeviceType.A5
+        and compress_ratio == 4
+        and head_dim == MXFP4_INDEXER_HEAD_DIM
+        # The legacy DSA-CP implementation calls DeviceOperator directly and
+        # still consumes the C8/FP8 cache contract.
+        and not enable_dsa_cp()
+    )
 
 
 def hadamard_linear(x: torch.Tensor, hadamard: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], int]:
@@ -92,9 +126,30 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
         super().__init__(head_dim, dtype, prefix, cache_config, compress_ratio)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        if get_ascend_device_type() in {AscendDeviceType.A5}:
+        use_mxfp4 = _use_mxfp4_indexer(
+            self.compress_ratio,
+            self.head_dim,
+        )
+        if use_mxfp4:
+            cache_head_size = MXFP4_INDEXER_PACKED_HEAD_DIM
+            cache_dtype = torch.uint8
+            cache_dtype_str = MXFP4_INDEXER_CACHE_DTYPE_STR
+            scale_dim = MXFP4_INDEXER_SCALE_DIM
+            scale_dtype = torch.uint8
+        elif get_ascend_device_type() in {AscendDeviceType.A5}:
             self.dtype = torch.float8_e4m3fn
             vllm_config.cache_config.cache_dtype = "float8_e4m3fn"
+            cache_head_size = self.head_dim
+            cache_dtype = self.dtype
+            cache_dtype_str = self.cache_config.cache_dtype
+            scale_dim = 1 if self.head_dim == MXFP4_INDEXER_HEAD_DIM else 0
+            scale_dtype = torch.float
+        else:
+            cache_head_size = self.head_dim
+            cache_dtype = self.dtype
+            cache_dtype_str = self.cache_config.cache_dtype
+            scale_dim = 1 if self.head_dim == MXFP4_INDEXER_HEAD_DIM else 0
+            scale_dtype = torch.float16
 
         from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
         from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
@@ -103,13 +158,13 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
         return AscendMLAAttentionSpec(
             block_size=storage_block_size * self.compress_ratio,
             num_kv_heads=1,
-            head_size=self.head_dim,
-            dtype=self.dtype,
+            head_size=cache_head_size,
+            dtype=cache_dtype,
             model_version="deepseek_v4",
             compress_ratio=self.compress_ratio,
-            cache_dtype_str=self.cache_config.cache_dtype,
-            scale_dim=1 if self.head_dim == 128 else 0,
-            scale_dtype=torch.float if get_ascend_device_type() in {AscendDeviceType.A5} else torch.float16,
+            cache_dtype_str=cache_dtype_str,
+            scale_dim=scale_dim,
+            scale_dtype=scale_dtype,
         )
 
     def forward(self): ...
@@ -142,25 +197,49 @@ class IndexerOverlapPlan:
 
 
 class AscendIndexerOps:
-    def __init__(self, index_topk: int) -> None:
+    def __init__(self, index_topk: int, use_mxfp4: bool = False) -> None:
         from vllm_ascend.device.device_op import DeviceOperator
 
         self.device_operator = DeviceOperator
         self.index_topk = index_topk
+        self.use_mxfp4 = use_mxfp4
+        self._e2m1_half_unit_lut: torch.Tensor | None = None
+
+    def _get_e2m1_half_unit_lut(self, device: torch.device) -> torch.Tensor:
+        if create_e2m1_half_unit_lut is None:
+            raise RuntimeError("The MXFP4 indexer path requires Triton")
+        if self._e2m1_half_unit_lut is None or self._e2m1_half_unit_lut.device != device:
+            self._e2m1_half_unit_lut = create_e2m1_half_unit_lut(device)
+        return self._e2m1_half_unit_lut
 
     def unpack_dsa_indexer_kv_cache(self, kv_cache: tuple[torch.Tensor, ...]):
         return self.device_operator.unpack_dsa_indexer_kv_cache(kv_cache)
 
     def quantize_query(self, query: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.use_mxfp4:
+            return self.device_operator.indexer_quantize_query(
+                query,
+                use_mxfp4=True,
+            )
         return self.device_operator.indexer_quantize_query(query)
 
     def quantize_key_and_update_cache(
         self,
         key: torch.Tensor,
         key_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
         full_cache: torch.Tensor | None,
         slot_mapping: torch.Tensor,
     ):
+        if self.use_mxfp4:
+            return self.device_operator.indexer_quant_scatter_part1(
+                key,
+                key_cache,
+                full_cache,
+                slot_mapping,
+                indexer_scale_cache=scale_cache,
+                use_mxfp4=True,
+            )
         return self.device_operator.indexer_quant_scatter_part1(
             key,
             key_cache,
@@ -189,6 +268,30 @@ class AscendIndexerOps:
         scale_cache: torch.Tensor,
         metadata: typing.Any,
     ) -> torch.Tensor:
+        if self.use_mxfp4:
+            if mxfp4_indexer_paged_qk_matmul is None or indexer_c4_score_topk is None:
+                raise RuntimeError("The MXFP4 indexer path requires Triton")
+            if metadata.max_seq_len is None:
+                raise ValueError("MXFP4 Indexer metadata requires max_seq_len")
+            qk_scores, valid_key_counts = mxfp4_indexer_paged_qk_matmul(
+                query,
+                query_scale,
+                key_cache,
+                scale_cache,
+                metadata.block_table,
+                metadata.query_start_loc,
+                metadata.seq_lens,
+                metadata.max_seq_len,
+                self._get_e2m1_half_unit_lut(query.device),
+            )
+            _, topk_indices = indexer_c4_score_topk(
+                qk_scores,
+                weights.float(),
+                self.index_topk,
+                valid_key_counts,
+            )
+            return topk_indices.unsqueeze(1)
+
         topk_idxs, _ = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer(
             query=query,
             key=key_cache,
@@ -223,14 +326,25 @@ class AscendIndexerOps:
         slot_mapping: torch.Tensor,
         metadata: typing.Any,
     ) -> torch.Tensor:
-        query, query_scale, _, _ = self.device_operator.indexer_quant_scatter(
-            query,
-            key,
-            key_cache,
-            scale_cache,
-            full_cache,
-            slot_mapping,
-        )
+        if self.use_mxfp4:
+            query, query_scale, _, _ = self.device_operator.indexer_quant_scatter(
+                query,
+                key,
+                key_cache,
+                scale_cache,
+                full_cache,
+                slot_mapping,
+                use_mxfp4=True,
+            )
+        else:
+            query, query_scale, _, _ = self.device_operator.indexer_quant_scatter(
+                query,
+                key,
+                key_cache,
+                scale_cache,
+                full_cache,
+                slot_mapping,
+            )
         return self.select_topk(
             query,
             weights,
@@ -280,7 +394,14 @@ class DeepseekV4Indexer(nn.Module):
         self.topk_indices_buffer = topk_indices_buffer
         if self.skip_topk and self.topk_indices_buffer is None:
             raise ValueError("skip_topk requires topk_indices_buffer")
-        self.ops = AscendIndexerOps(index_topk=self.index_topk)
+        self.use_mxfp4 = _use_mxfp4_indexer(
+            self.compress_ratio,
+            self.head_dim,
+        )
+        self.ops = AscendIndexerOps(
+            index_topk=self.index_topk,
+            use_mxfp4=self.use_mxfp4,
+        )
         self.weights_proj = ReplicatedLinear(
             config.hidden_size,
             self.n_heads,
@@ -290,7 +411,10 @@ class DeepseekV4Indexer(nn.Module):
             return_bias=False,
         )
         ascend_device_type = get_ascend_device_type()
-        k_dtype = torch.float8_e4m3fn if ascend_device_type == AscendDeviceType.A5 else torch.int8
+        if self.use_mxfp4:
+            k_dtype = torch.uint8
+        else:
+            k_dtype = torch.float8_e4m3fn if ascend_device_type == AscendDeviceType.A5 else torch.int8
 
         if self.compress_ratio == 4:
             # TODO(cmq): change the dtype of cache
@@ -351,6 +475,7 @@ class DeepseekV4Indexer(nn.Module):
         _, key_scale = self.ops.quantize_key_and_update_cache(
             key,
             key_cache,
+            scale_cache,
             full_cache,
             slot_mapping,
         )
@@ -500,6 +625,7 @@ class DeepseekV4Indexer(nn.Module):
                 kv, kv_scale = self.ops.quantize_key_and_update_cache(
                     kv,
                     indexer_k_cache,
+                    indexer_scale_cache,
                     indexer_full_cache,
                     slot_mapping_indexer,
                 )

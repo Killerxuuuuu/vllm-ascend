@@ -35,8 +35,14 @@ DSA_COMPRESSOR_SLOT_MAPPING_FLAT = 1
 DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET = 2
 
 if HAS_TRITON:
+    from vllm_ascend.ops.triton.indexer_mxfp4_cache import (
+        scatter_mxfp4_indexer_cache,
+    )
+    from vllm_ascend.ops.triton.mxfp4 import fp32_to_mxfp4
     from vllm_ascend.ops.triton.rms_norm import triton_q_rms  # noqa: F811
 else:
+    fp32_to_mxfp4 = None  # type: ignore
+    scatter_mxfp4_indexer_cache = None  # type: ignore
     triton_q_rms = None  # type: ignore
 
 
@@ -696,7 +702,7 @@ class BaseDeviceAdaptor:
     # ===== Indexer Quant + Scatter =====
 
     @staticmethod
-    def indexer_quantize_query(q):
+    def indexer_quantize_query(q, use_mxfp4: bool = False):
         """Quantize indexer query for lightning_indexer.
         Non-A5: int8 quant with float16 scale."""
         q_quant, q_scale = torch_npu.npu_dynamic_quant(q, dst_type=torch.int8)
@@ -704,7 +710,15 @@ class BaseDeviceAdaptor:
         return q_quant, q_scale
 
     @staticmethod
-    def indexer_quant_scatter(q, kv, indexer_k_cache, indexer_scale_cache, indexer_full_cache, slot_mapping):
+    def indexer_quant_scatter(
+        q,
+        kv,
+        indexer_k_cache,
+        indexer_scale_cache,
+        indexer_full_cache,
+        slot_mapping,
+        use_mxfp4: bool = False,
+    ):
         """Quantize q and scatter kv into indexer cache.
         Non-A5: int8 quant + 2x scatter_nd_update_v2 for k_cache and scale_cache."""
         q, q_scale = torch_npu.npu_dynamic_quant(q, dst_type=torch.int8)
@@ -723,7 +737,14 @@ class BaseDeviceAdaptor:
         return q, q_scale, kv_out, kv_scale_out
 
     @staticmethod
-    def indexer_quant_scatter_part1(kv, indexer_k_cache, indexer_full_cache, slot_mapping):
+    def indexer_quant_scatter_part1(
+        kv,
+        indexer_k_cache,
+        indexer_full_cache,
+        slot_mapping,
+        indexer_scale_cache=None,
+        use_mxfp4: bool = False,
+    ):
         """Part1 of multi-stream indexer scatter.
         Non-A5: quantize kv + scatter k_cache.
         Returns (kv_quant, kv_scale) for use in Part3, or (None, None) if kv is None."""
@@ -744,7 +765,11 @@ class BaseDeviceAdaptor:
         torch.ops._C_ascend.npu_scatter_nd_update_v2(indexer_scale_cache, slot_mapping, kv_scale)
 
     @staticmethod
-    def warmup_indexer_quant_scatter(hidden_states, slot_mapping):
+    def warmup_indexer_quant_scatter(
+        hidden_states,
+        slot_mapping,
+        use_mxfp4: bool = False,
+    ):
         """Warmup profiling for indexer quant+scatter.
         Non-A5: int8 quant + 2x scatter with dummy cache tensors."""
         kv_dummy, kv_scale_dummy = torch_npu.npu_dynamic_quant(hidden_states, dst_type=torch.int8)
@@ -1483,18 +1508,55 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
     # ===== Indexer Quant + Scatter =====
 
     @staticmethod
-    def indexer_quantize_query(q):
-        """Quantize indexer query. A5: fp8 quant, no extra scale conversion."""
+    def indexer_quantize_query(q, use_mxfp4: bool = False):
+        """Quantize an A5 indexer query to MXFP4 or the legacy FP8 format."""
+        if use_mxfp4:
+            if fp32_to_mxfp4 is None:
+                raise RuntimeError("The MXFP4 indexer path requires Triton")
+            return fp32_to_mxfp4(q.float())
         q_quant, q_scale = torch_npu.npu_dynamic_quant(q, dst_type=torch.float8_e4m3fn)
         return q_quant, q_scale
 
     @staticmethod
-    def indexer_quant_scatter(q, kv, indexer_k_cache, indexer_scale_cache, indexer_full_cache, slot_mapping):
-        """Quantize q (fp8) and scatter kv via fused indexer_compress_epilog_v2.
+    def indexer_quant_scatter(
+        q,
+        kv,
+        indexer_k_cache,
+        indexer_scale_cache,
+        indexer_full_cache,
+        slot_mapping,
+        use_mxfp4: bool = False,
+    ):
+        """Quantize q and scatter kv into the selected A5 indexer format.
+
+        The MXFP4 path stores two E2M1 values per byte plus four E8M0 scales
+        per 128-dimensional key. The legacy path retains the fused FP8 op.
+
         On A5, the fused op handles kv quantization, k_cache scatter, and
         scale_cache scatter internally. q is quantized separately for use
         by lightning_indexer."""
-        q, q_scale = torch_npu.npu_dynamic_quant(q, dst_type=torch.float8_e4m3fn)
+        if use_mxfp4:
+            if fp32_to_mxfp4 is None or scatter_mxfp4_indexer_cache is None:
+                raise RuntimeError("The MXFP4 indexer path requires Triton")
+            q, q_scale = fp32_to_mxfp4(q.float())
+
+            kv_out = kv
+            kv_scale_out = None
+            if kv is not None:
+                kv_out, kv_scale_out = fp32_to_mxfp4(kv.float())
+                scatter_mxfp4_indexer_cache(
+                    kv_out,
+                    kv_scale_out,
+                    indexer_k_cache,
+                    indexer_scale_cache,
+                    slot_mapping,
+                )
+            return q, q_scale, kv_out, kv_scale_out
+
+        q, q_scale = torch_npu.npu_dynamic_quant(
+            q,
+            dst_type=torch.float8_e4m3fn,
+        )
 
         kv_out = kv
         kv_scale_out = None
@@ -1509,12 +1571,37 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return q, q_scale, kv_out, kv_scale_out
 
     @staticmethod
-    def indexer_quant_scatter_part1(kv, indexer_k_cache, indexer_full_cache, slot_mapping):
+    def indexer_quant_scatter_part1(
+        kv,
+        indexer_k_cache,
+        indexer_full_cache,
+        slot_mapping,
+        indexer_scale_cache=None,
+        use_mxfp4: bool = False,
+    ):
         """Part1 of multi-stream indexer scatter.
         A5: fused indexer_compress_epilog_v2 handles both k_cache and scale_cache.
         Returns (kv, None) to signal Part3 is a no-op."""
         if kv is None:
             return None, None
+        if use_mxfp4:
+            if fp32_to_mxfp4 is None or scatter_mxfp4_indexer_cache is None:
+                raise RuntimeError("The MXFP4 indexer path requires Triton")
+            if indexer_scale_cache is None:
+                raise ValueError(
+                    "indexer_scale_cache is required for MXFP4 scatter"
+                )
+            kv_packed, kv_scales = fp32_to_mxfp4(kv.float())
+            scatter_mxfp4_indexer_cache(
+                kv_packed,
+                kv_scales,
+                indexer_k_cache,
+                indexer_scale_cache,
+                slot_mapping,
+            )
+            # Both cache components are written by the same Triton kernel, so
+            # the existing Part3 stream stage remains a no-op.
+            return kv_packed, None
         torch.ops._C_ascend.indexer_compress_epilog_v2(
             indexer_compress_cache=indexer_full_cache.view(torch.uint8),
             x=kv,
@@ -1530,9 +1617,35 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         pass
 
     @staticmethod
-    def warmup_indexer_quant_scatter(hidden_states, slot_mapping):
+    def warmup_indexer_quant_scatter(
+        hidden_states,
+        slot_mapping,
+        use_mxfp4: bool = False,
+    ):
         """Warmup profiling for indexer quant+scatter.
         A5: fused indexer_compress_epilog_v2 with dummy cache tensor."""
+        if use_mxfp4:
+            if fp32_to_mxfp4 is None or scatter_mxfp4_indexer_cache is None:
+                raise RuntimeError("The MXFP4 indexer path requires Triton")
+            packed, scales = fp32_to_mxfp4(hidden_states.float())
+            key_cache = torch.zeros(
+                (1, 1, 1, packed.shape[-1]),
+                dtype=torch.uint8,
+                device=hidden_states.device,
+            )
+            scale_cache = torch.zeros(
+                (1, 1, 1, scales.shape[-1]),
+                dtype=torch.uint8,
+                device=hidden_states.device,
+            )
+            scatter_mxfp4_indexer_cache(
+                packed,
+                scales,
+                key_cache,
+                scale_cache,
+                slot_mapping,
+            )
+            return
         dummy_cache_shape = (1, 1, 1, hidden_states.shape[-1])
         indexer_full_cache_dummy = torch.zeros(dummy_cache_shape, dtype=torch.uint8, device=hidden_states.device)
         torch.ops._C_ascend.indexer_compress_epilog_v2(

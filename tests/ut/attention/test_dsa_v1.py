@@ -308,8 +308,10 @@ def test_build_req_metadata_uses_for_prefill_and_decode(
     cached_req_metadata = cast(AscendDSAReqMetadata, cached_metadata.req_metadata)
     assert req_metadata.cos is cos
     assert req_metadata.sin is sin
+    assert req_metadata.max_seq_len == 8
     assert cached_req_metadata.cos is cos
     assert cached_req_metadata.sin is sin
+    assert cached_req_metadata.max_seq_len == 8
     sas_kwargs = builder._build_sas_metadata.call_args.kwargs
     qli_kwargs = builder._build_qli_metadata.call_args.kwargs
     assert sas_kwargs["metadata_cache"] is metadata_cache

@@ -208,6 +208,7 @@ class AscendDSAReqMetadata:
     slot_mapping: torch.Tensor | None
     storage_block_size: int
     query_start_loc: torch.Tensor
+    max_seq_len: int | None = None
 
     num_compressed_tokens: int | None = None
     sin: torch.Tensor = None
@@ -766,6 +767,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             slot_mapping=slot_mapping,
             storage_block_size=self.storage_block_size,
             query_start_loc=query_start_loc,
+            max_seq_len=max_seqlen_kv,
             num_compressed_tokens=num_compressed_tokens,
             sin=sin,
             cos=cos,
@@ -926,6 +928,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             slot_mapping=slot_mapping,
             storage_block_size=self.storage_block_size,
             query_start_loc=query_start_loc,
+            max_seq_len=max_seqlen_kv,
             num_compressed_tokens=self.num_actual_tokens,
             sin=sin,
             cos=cos,

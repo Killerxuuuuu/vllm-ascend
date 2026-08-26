@@ -447,3 +447,132 @@ class TestIndexerOps:
         assert qli_kwargs["actual_seq_lengths_key"] is metadata.seq_lens
         assert qli_kwargs["block_table"] is metadata.block_table
         assert qli_kwargs["metadata"] is metadata.qli_metadata
+
+    def test_mxfp4_quantize_scatter_passes_cache_contract(self):
+        indexer_ops = AscendIndexerOps(index_topk=3, use_mxfp4=True)
+        query = torch.ones((1, 64, 128))
+        key = torch.ones((1, 1, 128))
+        key_cache = torch.empty((1, 4, 1, 64), dtype=torch.uint8)
+        scale_cache = torch.empty((1, 4, 1, 4), dtype=torch.uint8)
+        slot_mapping = torch.zeros((1,), dtype=torch.int32)
+        quantized_query = torch.empty((1, 64, 64), dtype=torch.uint8)
+        query_scale = torch.empty((1, 64, 4), dtype=torch.uint8)
+        topk_indices = torch.zeros((1, 1, 3), dtype=torch.int32)
+
+        with (
+            patch.object(
+                DeviceOperator,
+                "indexer_quant_scatter",
+                return_value=(quantized_query, query_scale, key, None),
+            ) as quant_scatter,
+            patch.object(
+                indexer_ops,
+                "select_topk",
+                return_value=topk_indices,
+            ) as select_topk,
+        ):
+            actual = indexer_ops.quantize_update_cache_and_select_topk(
+                query,
+                key,
+                torch.ones((1, 64)),
+                key_cache,
+                scale_cache,
+                None,
+                slot_mapping,
+                SimpleNamespace(),
+            )
+
+        assert actual is topk_indices
+        quant_scatter.assert_called_once_with(
+            query,
+            key,
+            key_cache,
+            scale_cache,
+            None,
+            slot_mapping,
+            use_mxfp4=True,
+        )
+        select_topk.assert_called_once()
+
+        with patch.object(
+            DeviceOperator,
+            "indexer_quant_scatter_part1",
+            return_value=(key, None),
+        ) as scatter_part1:
+            indexer_ops.quantize_key_and_update_cache(
+                key,
+                key_cache,
+                scale_cache,
+                None,
+                slot_mapping,
+            )
+
+        scatter_part1.assert_called_once_with(
+            key,
+            key_cache,
+            None,
+            slot_mapping,
+            indexer_scale_cache=scale_cache,
+            use_mxfp4=True,
+        )
+
+    def test_mxfp4_select_topk_uses_paged_cache(self):
+        indexer_ops = AscendIndexerOps(index_topk=3, use_mxfp4=True)
+        query = torch.zeros((2, 64, 64), dtype=torch.uint8)
+        query_scale = torch.zeros((2, 64, 4), dtype=torch.uint8)
+        key_cache = torch.zeros((1, 4, 1, 64), dtype=torch.uint8)
+        scale_cache = torch.zeros((1, 4, 1, 4), dtype=torch.uint8)
+        weights = torch.ones((2, 64))
+        qk_scores = torch.zeros((2, 64, 4), dtype=torch.float32)
+        valid_key_counts = torch.tensor([2, 4], dtype=torch.int32)
+        topk_indices = torch.tensor([[1, 0, -1], [3, 2, 1]], dtype=torch.int32)
+        e2m1_lut = torch.zeros((16,), dtype=torch.int8)
+        metadata = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            seq_lens=torch.tensor([16], dtype=torch.int32),
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            max_seq_len=16,
+        )
+
+        with (
+            patch(
+                "vllm_ascend.models.deepseek_v4.indexer.create_e2m1_half_unit_lut",
+                return_value=e2m1_lut,
+            ) as create_lut,
+            patch(
+                "vllm_ascend.models.deepseek_v4.indexer.mxfp4_indexer_paged_qk_matmul",
+                return_value=(qk_scores, valid_key_counts),
+            ) as paged_qk,
+            patch(
+                "vllm_ascend.models.deepseek_v4.indexer.indexer_c4_score_topk",
+                return_value=(torch.empty(0), topk_indices),
+            ) as score_topk,
+        ):
+            actual = indexer_ops.select_topk(
+                query,
+                weights,
+                query_scale,
+                key_cache,
+                scale_cache,
+                metadata,
+            )
+
+        assert torch.equal(actual, topk_indices.unsqueeze(1))
+        create_lut.assert_called_once_with(query.device)
+        paged_qk.assert_called_once_with(
+            query,
+            query_scale,
+            key_cache,
+            scale_cache,
+            metadata.block_table,
+            metadata.query_start_loc,
+            metadata.seq_lens,
+            metadata.max_seq_len,
+            e2m1_lut,
+        )
+        score_topk.assert_called_once_with(
+            qk_scores,
+            weights.float(),
+            3,
+            valid_key_counts,
+        )

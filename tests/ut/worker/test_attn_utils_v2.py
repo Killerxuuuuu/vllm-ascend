@@ -42,9 +42,9 @@ from vllm_ascend.worker.v2.model_states.default import AscendModelState
         ),
         (
             AscendDeviceType.A5,
-            torch.float8_e4m3fn,
-            torch.float32,
-            (128, 1, 132),
+            torch.uint8,
+            torch.uint8,
+            (64, 4, 68),
         ),
     ],
 )
@@ -84,6 +84,16 @@ def test_mrv2_initializes_dsv4_cache_only_layer(
         deepseek_v4_indexer,
         "get_ascend_device_type",
         lambda: device_type,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_indexer,
+        "enable_dsa_cp",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_indexer,
+        "HAS_TRITON",
+        True,
     )
     monkeypatch.setattr(
         attn_utils,
