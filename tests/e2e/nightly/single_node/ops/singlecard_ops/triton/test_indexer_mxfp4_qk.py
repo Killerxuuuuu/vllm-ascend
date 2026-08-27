@@ -534,14 +534,12 @@ def test_a5_device_operator_quantizes_and_scatters_mxfp4():
         (2, INDEXER_NUM_HEADS, INDEXER_HEAD_DIM),
         generator=generator,
         dtype=torch.float32,
-        device="npu",
-    )
+    ).to("npu")
     key = torch.randn(
         (2, 1, INDEXER_HEAD_DIM),
         generator=generator,
         dtype=torch.float32,
-        device="npu",
-    )
+    ).to("npu")
     key_cache = torch.zeros(
         (2, 2, 1, INDEXER_PACKED_HEAD_DIM),
         dtype=torch.uint8,
@@ -606,20 +604,17 @@ def test_a5_indexer_ops_runs_mxfp4_cache_to_topk_path():
         (2, INDEXER_NUM_HEADS, INDEXER_HEAD_DIM),
         generator=generator,
         dtype=torch.float32,
-        device="npu",
-    )
+    ).to("npu")
     key = torch.randn(
         (4, 1, INDEXER_HEAD_DIM),
         generator=generator,
         dtype=torch.float32,
-        device="npu",
-    )
+    ).to("npu")
     weights = torch.rand(
         (2, INDEXER_NUM_HEADS),
         generator=generator,
         dtype=torch.float32,
-        device="npu",
-    )
+    ).to("npu")
     key_cache = torch.zeros(
         (1, 4, 1, INDEXER_PACKED_HEAD_DIM),
         dtype=torch.uint8,
