@@ -33,6 +33,7 @@ import torch_npu
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 from vllm.config import CacheConfig, VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.deepseek_v4.attention import DeepseekV4IndexerCache
@@ -50,6 +51,8 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     npu_stream_switch,
 )
+
+logger = init_logger(__name__)
 
 if HAS_TRITON:
     from vllm_ascend.ops.triton.indexer_block_topk import (
@@ -398,6 +401,11 @@ class DeepseekV4Indexer(nn.Module):
             self.compress_ratio,
             self.head_dim,
         )
+        if self.use_mxfp4:
+            logger.info_once(
+                "DeepSeek V4 C4 Indexer runtime MXFP4 path enabled "
+                "(E2M1 packed uint8, E8M0 group-32 scales)."
+            )
         self.ops = AscendIndexerOps(
             index_topk=self.index_topk,
             use_mxfp4=self.use_mxfp4,
