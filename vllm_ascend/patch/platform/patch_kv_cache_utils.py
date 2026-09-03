@@ -189,21 +189,13 @@ def _get_kv_cache_config_deepseek_v4(
 ) -> tuple[int, list[KVCacheTensor]]:
     """DeepseekV4 KV cache tensor layout planning.
 
-    Precondition: kv_cache_groups[0] is the full-MLA group; its page sizes
-    define the canonical bucket set. Non-full-MLA groups must have been
-    page_size-padded upstream (see _get_kv_cache_groups_uniform_groups) so
-    every layer's page_size matches one of the full-MLA bucket sizes.
-
     For each group, bucket its layers by page_size_bytes and place each
     layer at tuple_idx = position-within-bucket. Emit one KVCacheTensor
     per (tuple_idx, bucket) whose shared_by is the union of per-group
-    layers at that slot.
+    layers at that slot. The bucket set is the union across every group;
+    this is required when a quantized cache introduces a page size that is
+    not present in the first full-MLA group.
     """
-    full_mla_spec = kv_cache_groups[0].kv_cache_spec
-    assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
-    page_sizes = sorted(full_mla_spec.get_page_sizes())
-    layer_tuple_page_bytes = sum(page_sizes)
-
     # Pre-bucket each group's layers by page_size (registration order within
     # bucket). bucketed[g_idx][page_size] = [layer_name, ...].
     mtp_layer_names = []
@@ -220,6 +212,21 @@ def _get_kv_cache_config_deepseek_v4(
                 mtp_layer_names.append(name)
                 mtp_page_size = specs[name].page_size_bytes
         bucketed.append(b)
+
+    # The C8 layout used to make the indexer K cache and its compressor
+    # state cache land in the same canonical page-size bucket. MXFP4 makes
+    # the K cache smaller, so deriving the buckets only from the first MLA
+    # group can silently omit the state cache. Build the physical bucket set
+    # from every group instead: each distinct page size gets its own tensor,
+    # and equal-sized pages can still share one allocation.
+    page_sizes = sorted(
+        {
+            page_size
+            for group_buckets in bucketed
+            for page_size in group_buckets
+        }
+    )
+    layer_tuple_page_bytes = sum(page_sizes)
 
     # num_layer_tuples = longest bucket list across all groups. For the
     # full-MLA group this equals the count of layers in the largest
@@ -241,6 +248,25 @@ def _get_kv_cache_config_deepseek_v4(
             kv_cache_tensors.append(KVCacheTensor(size=ps * num_blocks, shared_by=shared_by))
     for i in range(len(mtp_layer_names)):
         kv_cache_tensors.append(KVCacheTensor(size=mtp_page_size * num_blocks, shared_by=[mtp_layer_names[i]]))
+
+    expected_layer_names = {
+        layer_name
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+    }
+    planned_layer_names = {
+        layer_name
+        for tensor in kv_cache_tensors
+        for layer_name in tensor.shared_by
+    }
+    if planned_layer_names != expected_layer_names:
+        missing_layers = sorted(expected_layer_names - planned_layer_names)
+        unexpected_layers = sorted(planned_layer_names - expected_layer_names)
+        raise AssertionError(
+            "DeepSeek V4 KV cache layout omitted layers: "
+            f"missing_layers={missing_layers}, "
+            f"unexpected_layers={unexpected_layers}"
+        )
 
     return num_blocks, kv_cache_tensors
 

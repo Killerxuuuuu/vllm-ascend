@@ -30,6 +30,7 @@ from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _ascend_resolve_kv_cache_block_sizes,
+    _get_kv_cache_config_deepseek_v4,
     group_and_unify_kv_cache_specs,
 )
 from vllm_ascend.patch.platform.patch_mamba_manager import AscendMambaManager
@@ -109,6 +110,7 @@ def _make_vllm_config(
             block_size=block_size,
             enable_prefix_caching=enable_prefix_caching,
             prefix_match_unit=None,
+            num_gpu_blocks_override=None,
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=dcp,
@@ -210,6 +212,87 @@ def test_deepseek_v4_scheduler_lcm_uses_logical_group_sizes() -> None:
 
     assert scheduler_block_size == 16384
     assert hash_block_size == 512
+
+
+def test_deepseek_v4_layout_keeps_noncanonical_indexer_state_cache() -> None:
+    """MXFP4 must not drop the larger indexer compressor state page."""
+    indexer_k_name = "model.layers.0.self_attn.indexer.k_cache"
+    indexer_state_name = (
+        "model.layers.0.self_attn.indexer.compressor.state_cache"
+    )
+    c128_name = "model.layers.1.self_attn.attn"
+
+    indexer_k_spec = MLAAttentionSpec(
+        block_size=128 * 4,
+        num_kv_heads=1,
+        head_size=68,
+        dtype=torch.uint8,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    c128_spec = MLAAttentionSpec(
+        block_size=128 * 128,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        compress_ratio=128,
+        model_version="deepseek_v4",
+    )
+    indexer_state_spec = SlidingWindowMLASpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+        sliding_window=8,
+        page_size_padded=16640,
+        model_version="deepseek_v4",
+    )
+
+    indexer_group = UniformTypeKVCacheSpecs.from_specs(
+        {indexer_k_name: indexer_k_spec}
+    )
+    c128_group = UniformTypeKVCacheSpecs.from_specs({c128_name: c128_spec})
+    indexer_state_group = UniformTypeKVCacheSpecs.from_specs(
+        {indexer_state_name: indexer_state_spec}
+    )
+    assert indexer_group is not None
+    assert c128_group is not None
+    assert indexer_state_group is not None
+    groups = [
+        KVCacheGroupSpec(
+            layer_names=[indexer_k_name],
+            kv_cache_spec=indexer_group,
+        ),
+        KVCacheGroupSpec(
+            layer_names=[c128_name],
+            kv_cache_spec=c128_group,
+        ),
+        KVCacheGroupSpec(
+            layer_names=[indexer_state_name],
+            kv_cache_spec=indexer_state_group,
+        ),
+    ]
+
+    _, tensors = _get_kv_cache_config_deepseek_v4(
+        _make_vllm_config(
+            enable_prefix_caching=False,
+            dcp=1,
+            block_size=128,
+        ),
+        groups,
+        available_memory=1024 * 1024,
+    )
+
+    planned_layer_names = {
+        layer_name
+        for tensor in tensors
+        for layer_name in tensor.shared_by
+    }
+    assert planned_layer_names == {
+        indexer_k_name,
+        indexer_state_name,
+        c128_name,
+    }
 
 
 @pytest.mark.parametrize(
