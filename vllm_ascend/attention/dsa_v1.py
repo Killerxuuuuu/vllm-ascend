@@ -33,7 +33,11 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.distributed.parallel_state import get_otp_group
 from vllm_ascend.models.deepseek_v4.compressor import AscendCompressorMetadata
-from vllm_ascend.models.deepseek_v4.indexer import AscendIndexerMetadata, IndexerOverlapPlan
+from vllm_ascend.models.deepseek_v4.indexer import (
+    AscendIndexerMetadata,
+    IndexerOverlapPlan,
+    _use_mxfp4_indexer,
+)
 from vllm_ascend.ops.cv_linear import CVLinearWrapper
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
@@ -392,6 +396,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.seq_lens: torch.Tensor = None
 
         self.compressor_ratio = getattr(kv_cache_spec, "compress_ratio", 0)
+        hf_config = self.model_config.hf_config
+        self.uses_mxfp4_indexer = (
+            hf_config.model_type == "deepseek_v4"
+            and _use_mxfp4_indexer(4, hf_config.index_head_dim)
+        )
         self.hadamard = None
         self._init_hadamard(layer_names)
         self.start_pos_prefill: torch.Tensor = torch.zeros(
@@ -669,6 +678,27 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.qli_metadata_buffer[:DSA_METADATA_BUFFER_SIZE] = qli_metadata
         return self.qli_metadata_buffer
 
+    def _build_qli_metadata_if_needed(
+        self,
+        metadata_cache: dict,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_kv: int,
+    ) -> torch.Tensor | None:
+        # The MXFP4 Triton Indexer reads the ordinary paged-cache metadata
+        # directly. The legacy C8 QLI metadata buffer is neither accepted by
+        # nor consumed by that path, so avoid launching its custom operator.
+        if self.uses_mxfp4_indexer:
+            return None
+        return self._build_qli_metadata(
+            metadata_cache=metadata_cache,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+        )
+
     def build_req_metadata(
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
@@ -744,7 +774,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             cu_seqlens_ori_kv=cu_seqlens_ori_kv,
             cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
         )
-        qli_metadata = self._build_qli_metadata(
+        qli_metadata = self._build_qli_metadata_if_needed(
             metadata_cache=self.common_ratio_to_sas_metadata,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,

@@ -224,6 +224,23 @@ def test_build_qli_metadata_parameters_cache_and_builder_buffer():
     assert call_kwargs["cmp_ratio"] == 4
 
 
+def test_mxfp4_skips_legacy_qli_metadata_operator():
+    builder = _make_builder()
+    builder.uses_mxfp4_indexer = True
+    builder._build_qli_metadata = MagicMock()
+
+    result = builder._build_qli_metadata_if_needed(
+        metadata_cache={},
+        query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
+        seq_lens=torch.tensor([8, 6], dtype=torch.int32),
+        max_seqlen_q=2,
+        max_seqlen_kv=8,
+    )
+
+    assert result is None
+    builder._build_qli_metadata.assert_not_called()
+
+
 @pytest.mark.parametrize("num_prefills", [0, 1])
 def test_build_req_metadata_uses_for_prefill_and_decode(
     num_prefills: int,
