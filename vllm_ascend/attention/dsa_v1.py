@@ -1114,28 +1114,78 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         # before ACL graph capture (profiling run triggers it).
         pass
 
+    def _get_batched_wo_a_weight(self, num_groups: int) -> torch.Tensor:
+        """Return wo_a in the DSA batched-matmul layout [group, input, rank]."""
+        weight = self.wo_a.weight
+        if weight.ndim == 3:
+            if weight.shape[0] == num_groups:
+                return weight
+            if weight.shape[1] == num_groups:
+                return weight.permute(1, 0, 2)
+            raise RuntimeError(
+                "DSA wo_a weight has no group axis matching the o_proj input: "
+                f"weight_shape={tuple(weight.shape)}, num_groups={num_groups}."
+            )
+
+        linear_method = getattr(
+            self.wo_a.quant_method,
+            "quant_method",
+            self.wo_a.quant_method,
+        )
+        if isinstance(linear_method, AscendUnquantizedLinearMethod):
+            return weight.reshape(num_groups, -1, weight.shape[-1]).transpose(1, 2)
+        return weight.reshape(weight.shape[0], num_groups, -1).permute(1, 0, 2)
+
+    def _get_batched_wo_a_scale(self, num_groups: int) -> torch.Tensor:
+        """Move the output-sharded wo_a scale's group axis to the front."""
+        scale = self.wo_a.weight_scale
+        if scale.ndim == 1:
+            return scale.reshape(num_groups, -1)
+        if scale.shape[0] == num_groups:
+            return scale
+        if scale.shape[1] % num_groups != 0:
+            raise RuntimeError(
+                "DSA wo_a scale cannot be reshaped by o_proj group: "
+                f"scale_shape={tuple(scale.shape)}, num_groups={num_groups}."
+            )
+        scale = scale.reshape(scale.shape[0], num_groups, -1, *scale.shape[2:])
+        return scale.permute(1, 0, 2, *range(3, scale.ndim))
+
     def _forward_o_proj(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         num_tokens = o_proj_input.shape[0]
         group_hidden_dim = o_proj_input.shape[1] * o_proj_input.shape[2] // self.n_local_groups
         o_proj_input = o_proj_input.view(num_tokens, self.n_local_groups, group_hidden_dim)
-        # A5 (Ascend950) uses an FP8-quantized o_proj path (dynamic MX quant
-        # + quantized batch matmul). Preserve it as-is: it predates and is
-        # orthogonal to the OTP / olora_tp paths below, so it must win first.
+        # A5 (Ascend950) supports both BF16 and FP8 checkpoints. Only the FP8
+        # linear method creates weight_scale; BF16 must use the ordinary
+        # batched matmul instead of being forced through dynamic MX quant.
         if get_ascend_device_type() in {AscendDeviceType.A5}:
             o = o_proj_input
-            o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
-            o = torch_npu.npu_transpose_quant_batchmatmul(
-                o,
-                self.wo_a.weight,
-                dtype=torch.bfloat16,
-                bias=None,
-                group_sizes=(0, 0, 32),
-                x1_scale=swiglu_out_scale.view(torch.float8_e8m0fnu),
-                x2_scale=self.wo_a.weight_scale.view(torch.float8_e8m0fnu),
-                perm_x1=(1, 0, 2),
-                perm_x2=(0, 1, 2),
-                perm_y=(1, 0, 2),
+            linear_method = getattr(
+                self.wo_a.quant_method,
+                "quant_method",
+                self.wo_a.quant_method,
             )
+            if isinstance(linear_method, AscendUnquantizedLinearMethod):
+                o = torch.bmm(
+                    o.transpose(0, 1),
+                    self._get_batched_wo_a_weight(self.n_local_groups),
+                ).transpose(0, 1)
+            else:
+                o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
+                o = torch_npu.npu_transpose_quant_batchmatmul(
+                    o,
+                    self._get_batched_wo_a_weight(self.n_local_groups),
+                    dtype=torch.bfloat16,
+                    bias=None,
+                    group_sizes=(0, 0, 32),
+                    x1_scale=swiglu_out_scale.view(torch.float8_e8m0fnu),
+                    x2_scale=self._get_batched_wo_a_scale(self.n_local_groups).view(
+                        torch.float8_e8m0fnu
+                    ),
+                    perm_x1=(1, 0, 2),
+                    perm_x2=(0, 1, 2),
+                    perm_y=(1, 0, 2),
+                )
             o = o.reshape(num_tokens, -1)
             output[...] = self.wo_b(o)
         elif oproj_tp_enable():

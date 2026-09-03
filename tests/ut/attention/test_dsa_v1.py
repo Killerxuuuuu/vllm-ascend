@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+import torch_npu
 
 from vllm_ascend.attention.context_parallel.dsa_cp import (
     AscendDSAPCPImpl,
@@ -41,6 +42,8 @@ from vllm_ascend.models.deepseek_v4.indexer import (
     AscendIndexerMetadata,
     IndexerOverlapPlan,
 )
+from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+from vllm_ascend.utils import AscendDeviceType
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 
 
@@ -625,6 +628,39 @@ def _make_impl(
             attn_sink=None,
             swa_cache_layer=SimpleNamespace(prefix="swa_cache"),
         )
+
+
+def test_a5_bf16_o_proj_does_not_require_weight_scale():
+    impl = _make_impl()
+    impl.n_local_groups = 2
+    impl.o_lora_rank = 3
+    impl.wo_a = SimpleNamespace(
+        weight=torch.arange(24, dtype=torch.float32).reshape(6, 4),
+        quant_method=AscendUnquantizedLinearMethod(),
+    )
+    impl.wo_b = MagicMock(side_effect=lambda value: value)
+    o_proj_input = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
+    output = torch.empty((2, 6), dtype=torch.float32)
+
+    batched_weight = impl.wo_a.weight.reshape(2, 3, 4).transpose(1, 2)
+    expected = torch.bmm(
+        o_proj_input.reshape(2, 2, 4).transpose(0, 1),
+        batched_weight,
+    ).transpose(0, 1).reshape(2, 6)
+
+    with (
+        patch(
+            "vllm_ascend.attention.dsa_v1.get_ascend_device_type",
+            return_value=AscendDeviceType.A5,
+        ),
+        patch.object(torch_npu, "npu_dynamic_mx_quant") as dynamic_quant,
+    ):
+        actual = impl._forward_o_proj(o_proj_input, output)
+
+    assert actual is output
+    assert torch.equal(actual, expected)
+    dynamic_quant.assert_not_called()
+    impl.wo_b.assert_called_once()
 
 
 def test_forward_runs_mixed_prefill_and_decode_in_one_attention_call():
