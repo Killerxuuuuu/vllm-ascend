@@ -32,6 +32,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner.hybrid_with_attn_and_mamba = False
         runner.sfa_dcp_replicated_indexer_size = 1
         runner.runner_only_attn_layers = set()
+        runner.shared_kv_cache_layers = {}
         runner.is_kv_consumer = False
         runner.sparse_kv_offload_enabled = False
         runner.sparse_kv_offload_config = MagicMock()
@@ -138,6 +139,49 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
+
+    def test_kv_sharing_layer_reuses_target_raw_allocation(self):
+        runner = self._build_runner()
+        target_layer = "model.layers.0.self_attn"
+        sharing_layer = "model.layers.1.self_attn"
+        runner.shared_kv_cache_layers = {sharing_layer: target_layer}
+        kv_cache_spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=64,
+            head_size_v=64,
+            dtype=torch.float16,
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=kv_cache_spec.page_size_bytes * 2,
+                    shared_by=[target_layer],
+                )
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=[target_layer, sharing_layer],
+                    kv_cache_spec=kv_cache_spec,
+                )
+            ],
+        )
+
+        raw_caches = runner._allocate_kv_cache_tensors(kv_cache_config)
+
+        self.assertEqual(set(raw_caches), {target_layer})
+
+        runner._kv_cache_spec_attn_group_iterator = lambda: [
+            SimpleNamespace(
+                kv_cache_spec=kv_cache_spec,
+                backend=runner.attn_backend,
+                layer_names=[target_layer, sharing_layer],
+            )
+        ]
+        caches = runner._reshape_kv_cache_tensors(kv_cache_config, raw_caches)
+
+        self.assertEqual(set(caches), {target_layer})
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")

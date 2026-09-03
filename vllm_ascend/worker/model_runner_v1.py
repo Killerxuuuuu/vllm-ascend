@@ -4093,7 +4093,21 @@ class NPUModelRunner(GPUModelRunner):
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 layer_names.add(layer_name)
-        assert layer_names == set(kv_cache_raw_tensors.keys()), "Some layers are not correctly initialized"
+
+        # Newer vLLM versions add KV-sharing layers to kv_cache_groups so the
+        # scheduler can account for them, but those layers intentionally have
+        # no independent raw allocation. Their views are bound to the target
+        # layer after reshaping in initialize_kv_cache_tensors().
+        initialized_layer_names = set(kv_cache_raw_tensors) | set(self.shared_kv_cache_layers)
+        initialized_layer_names -= self.runner_only_attn_layers
+        if layer_names != initialized_layer_names:
+            missing_layers = sorted(layer_names - initialized_layer_names)
+            unexpected_layers = sorted(initialized_layer_names - layer_names)
+            raise AssertionError(
+                "Some layers are not correctly initialized: "
+                f"missing_layers={missing_layers}, "
+                f"unexpected_layers={unexpected_layers}"
+            )
 
         return kv_cache_raw_tensors
 
@@ -4152,7 +4166,10 @@ class NPUModelRunner(GPUModelRunner):
             attn_backend = group.backend
             current_kv_cache_spec = group.kv_cache_spec
             for layer_name in group.layer_names:
-                if layer_name in self.runner_only_attn_layers:
+                if (
+                    layer_name in self.runner_only_attn_layers
+                    or layer_name in self.shared_kv_cache_layers
+                ):
                     continue
 
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
