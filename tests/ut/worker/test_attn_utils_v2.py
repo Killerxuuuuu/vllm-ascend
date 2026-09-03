@@ -26,6 +26,7 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.models.deepseek_v4 import compressor as deepseek_v4_compressor
 from vllm_ascend.models.deepseek_v4 import indexer as deepseek_v4_indexer
 from vllm_ascend.models.deepseek_v4 import model as deepseek_v4_model
+from vllm_ascend.models.layer.attention import layer as deepseek_v4_attention
 from vllm_ascend.utils import AscendDeviceType
 from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
@@ -78,6 +79,7 @@ def test_mrv2_initializes_dsv4_cache_only_layer(
     cache_layer.dtype = torch.int8
     cache_layer.cache_config = cache_config
     cache_layer.compress_ratio = 4
+    cache_layer.storage_block_size = cache_config.block_size
     cache_layer.kv_cache = torch.tensor([])
 
     monkeypatch.setattr(
@@ -125,6 +127,15 @@ def test_mrv2_initializes_dsv4_cache_only_layer(
     merged_spec = spec.merge([spec])
     assert merged_spec.compress_ratio == cache_layer.compress_ratio
     assert merged_spec.storage_block_size == cache_config.block_size
+
+    # Newer vLLM versions replace the shared value with the smallest physical
+    # block size after the first cache-spec discovery. A repeated discovery
+    # must continue using the DSV4 size resolved during layer construction.
+    cache_config.block_size = 2
+    repeated_spec = cache_layer.get_kv_cache_spec(vllm_config)
+    assert repeated_spec.block_size == spec.block_size
+    assert repeated_spec.storage_block_size == spec.storage_block_size
+    cache_config.block_size = cache_layer.storage_block_size
 
     num_blocks = 2
     kv_cache_config = KVCacheConfig(
@@ -312,6 +323,36 @@ def test_dsv4_backends_declare_role_specific_logical_sizes(
     assert deepseek_v4_model.AscendDeepseekV4SWACache.get_attn_backend(swa_cache) is AscendDSASWABackend
     assert deepseek_v4_compressor.AscendCompressorStateCache.get_attn_backend(c4_state) is AscendDSAC4StateBackend
     assert deepseek_v4_compressor.AscendCompressorStateCache.get_attn_backend(c128_state) is AscendDSAC128StateBackend
+
+
+def test_dsa_attention_cache_spec_uses_resolved_storage_block_size(monkeypatch):
+    attention = deepseek_v4_attention.DSAAttention.__new__(
+        deepseek_v4_attention.DSAAttention
+    )
+    attention.compress_ratio = 4
+    attention.head_size = 512
+    attention.kv_cache_dtype = "auto"
+    attention.storage_block_size = 128
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=8, cache_dtype="auto"),
+        model_config=SimpleNamespace(),
+    )
+
+    monkeypatch.setattr(
+        deepseek_v4_attention,
+        "get_ascend_device_type",
+        lambda: AscendDeviceType.A2,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention,
+        "kv_cache_dtype_str_to_dtype",
+        lambda *_args: torch.bfloat16,
+    )
+
+    spec = attention.get_kv_cache_spec(vllm_config)
+
+    assert spec.block_size == 512
+    assert spec.storage_block_size == 128
 
 
 @pytest.mark.parametrize(

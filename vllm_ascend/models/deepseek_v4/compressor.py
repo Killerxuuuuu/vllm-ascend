@@ -48,18 +48,15 @@ class AscendCompressorStateCache(CompressorStateCache):
         dtype: torch.dtype,
         compress_ratio: int,
         block_size: int,
+        page_size_padded: int,
         prefix: str,
     ):
         super().__init__(state_dim, dtype, compress_ratio, prefix)
         self.compress_ratio = compress_ratio
         self.block_size = block_size
+        self.page_size_padded = page_size_padded
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
-
-        pads = DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][1]
-        page_size_padded = pads[0] if self.state_dim == 2 * 256 and self.compress_ratio == 4 else pads[1]
-
         return AscendSlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
@@ -67,7 +64,7 @@ class AscendCompressorStateCache(CompressorStateCache):
             dtype=self.dtype,
             sliding_window=self.sliding_window,
             alignment=None,
-            page_size_padded=page_size_padded,
+            page_size_padded=self.page_size_padded,
         )
 
     def forward(self): ...
@@ -120,6 +117,7 @@ class Compressor(nn.Module):
         self.rotate = rotate
         self.norm_eps = config.rms_norm_eps
         self.coff = 1 + self.overlap
+        dsv4_block_sizes = DSV4_BLOCK_SIZES[cache_config.block_size]
 
         self.ape = nn.Parameter(torch.empty(compress_ratio, self.coff * self.head_dim, dtype=torch.float32))
         self.wkv = ReplicatedLinear(
@@ -144,14 +142,19 @@ class Compressor(nn.Module):
         self.norm = RMSNorm(self.head_dim, config.rms_norm_eps, dtype=norm_dtype)
 
         state_dtype = torch.float32
-        # TODO(zyj): change following codes if block_size is configurable & refactor the magic numbers
+        # Resolve the state-cache layout before vLLM rewrites the shared
+        # CacheConfig.block_size while constructing cache groups.
         if compress_ratio == 4:
+            state_dim = 2 * self.coff * self.head_dim
             self.state_cache = AscendCompressorStateCache(
-                state_dim=2 * self.coff * self.head_dim,  # kv_state + score_state
+                state_dim=state_dim,  # kv_state + score_state
                 dtype=state_dtype,
                 compress_ratio=compress_ratio,
                 prefix=f"{prefix}.state_cache",
-                block_size=DSV4_BLOCK_SIZES[cache_config.block_size][0][2],
+                block_size=dsv4_block_sizes[0][2],
+                page_size_padded=(
+                    dsv4_block_sizes[1][0] if state_dim == 2 * 256 else dsv4_block_sizes[1][1]
+                ),
             )
         elif compress_ratio == 128:
             self.state_cache = AscendCompressorStateCache(
@@ -159,7 +162,8 @@ class Compressor(nn.Module):
                 dtype=state_dtype,
                 compress_ratio=compress_ratio,
                 prefix=f"{prefix}.state_cache",
-                block_size=DSV4_BLOCK_SIZES[cache_config.block_size][0][3],
+                block_size=dsv4_block_sizes[0][3],
+                page_size_padded=dsv4_block_sizes[1][1],
             )
         else:
             raise ValueError(

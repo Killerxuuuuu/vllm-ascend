@@ -127,6 +127,13 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
         compress_ratio: int = 1,
     ):
         super().__init__(head_dim, dtype, prefix, cache_config, compress_ratio)
+        from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+
+        # CacheConfig is shared and newer vLLM versions may later replace its
+        # logical block size with the smallest block size among all KV-cache
+        # groups. Resolve the Indexer storage size while the original DSV4
+        # block size (32/64/128) is still available.
+        self.storage_block_size = DSV4_BLOCK_SIZES[cache_config.block_size][0][0]
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         use_mxfp4 = _use_mxfp4_indexer(
@@ -155,11 +162,8 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
             scale_dtype = torch.float16
 
         from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
-        from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
-
-        storage_block_size = DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][0][0]
         return AscendMLAAttentionSpec(
-            block_size=storage_block_size * self.compress_ratio,
+            block_size=self.storage_block_size * self.compress_ratio,
             num_kv_heads=1,
             head_size=cache_head_size,
             dtype=cache_dtype,

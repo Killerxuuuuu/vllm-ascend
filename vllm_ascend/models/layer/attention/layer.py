@@ -105,8 +105,13 @@ class DSAAttention(nn.Module, AttentionLayerBase):
 
         if cache_config is not None:
             kv_cache_dtype = cache_config.cache_dtype
+            # Resolve this layer's physical page size before vLLM potentially
+            # rewrites the shared CacheConfig.block_size during cache-group
+            # construction.
+            self.storage_block_size = DSV4_BLOCK_SIZES[cache_config.block_size][0][0]
         else:
             kv_cache_dtype = "auto"
+            self.storage_block_size = None
 
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)
@@ -185,11 +190,12 @@ class DSAAttention(nn.Module, AttentionLayerBase):
         cached_head_size = (
             (self.head_size + 128) if get_ascend_device_type() in {AscendDeviceType.A5} else self.head_size
         )
-        storage_block_size = DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][0][0]
+        if self.storage_block_size is None:
+            raise ValueError("DSAAttention requires cache_config to build its KV cache spec")
         return AscendMLAAttentionSpec(
             # The scheduler operates in raw-token units. Ascend kernels keep
             # using the compressed page exposed by storage_block_size.
-            block_size=storage_block_size * self.compress_ratio,
+            block_size=self.storage_block_size * self.compress_ratio,
             num_kv_heads=1,
             head_size=cached_head_size,
             dtype=kv_cache_dtype,

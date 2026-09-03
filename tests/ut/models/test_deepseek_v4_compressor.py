@@ -150,7 +150,10 @@ class TestCompressorStateCache:
         cache.block_size = 8
         cache.dtype = torch.float32
         cache.sliding_window = 64
-        vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=128))
+        cache.page_size_padded = DSV4_BLOCK_SIZES[128][1][padding_index]
+        # Simulate vLLM replacing the logical 128-token value with the C4
+        # physical block size before asking the layer for its spec again.
+        vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=8))
 
         spec = cache.get_kv_cache_spec(vllm_config)
 
