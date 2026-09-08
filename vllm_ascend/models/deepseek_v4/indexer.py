@@ -62,10 +62,12 @@ if HAS_TRITON:
         create_e2m1_half_unit_lut,
         mxfp4_indexer_paged_qk_matmul,
     )
+    from vllm_ascend.ops.triton.mxfp4 import mxfp4_to_fp32
 else:
     create_e2m1_half_unit_lut = None  # type: ignore
     indexer_c4_score_topk = None  # type: ignore
     mxfp4_indexer_paged_qk_matmul = None  # type: ignore
+    mxfp4_to_fp32 = None  # type: ignore
 
 
 MXFP4_INDEXER_HEAD_DIM = 128
@@ -74,10 +76,15 @@ MXFP4_INDEXER_SCALE_DIM = MXFP4_INDEXER_HEAD_DIM // 32
 MXFP4_INDEXER_CACHE_DTYPE_STR = "mxfp4"
 
 
-def _use_mxfp4_indexer(compress_ratio: int, head_dim: int) -> bool:
+def _use_mxfp4_indexer(
+    compress_ratio: int,
+    head_dim: int,
+    enabled: bool = True,
+) -> bool:
     """Whether this Indexer instance can use the Triton MXFP4 path."""
     return (
-        HAS_TRITON
+        enabled
+        and HAS_TRITON
         and get_ascend_device_type() == AscendDeviceType.A5
         and compress_ratio == 4
         and head_dim == MXFP4_INDEXER_HEAD_DIM
@@ -136,9 +143,11 @@ class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
         self.storage_block_size = DSV4_BLOCK_SIZES[cache_config.block_size][0][0]
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        hf_config = vllm_config.model_config.hf_config
         use_mxfp4 = _use_mxfp4_indexer(
             self.compress_ratio,
             self.head_dim,
+            enabled=getattr(hf_config, "use_mxfp4_indexer", True),
         )
         if use_mxfp4:
             cache_head_size = MXFP4_INDEXER_PACKED_HEAD_DIM
@@ -204,13 +213,104 @@ class IndexerOverlapPlan:
 
 
 class AscendIndexerOps:
-    def __init__(self, index_topk: int, use_mxfp4: bool = False) -> None:
+    def __init__(
+        self,
+        index_topk: int,
+        use_mxfp4: bool = False,
+        debug_mxfp4_cache_error: bool = False,
+        debug_name: str = "",
+    ) -> None:
         from vllm_ascend.device.device_op import DeviceOperator
 
         self.device_operator = DeviceOperator
         self.index_topk = index_topk
         self.use_mxfp4 = use_mxfp4
+        self.debug_mxfp4_cache_error = debug_mxfp4_cache_error
+        self.debug_name = debug_name
+        self._mxfp4_cache_error_logged = False
         self._e2m1_half_unit_lut: torch.Tensor | None = None
+
+    @torch.inference_mode()
+    def _log_mxfp4_cache_roundtrip_error(
+        self,
+        key: torch.Tensor | None,
+        key_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Log one real write/read/dequant error sample for this Indexer.
+
+        This intentionally copies the sampled tensors to CPU. It is guarded by
+        an explicit debug option and runs only once per Indexer instance, so the
+        synchronization never enters the normal inference hot path.
+        """
+        if (
+            not self.debug_mxfp4_cache_error
+            or self._mxfp4_cache_error_logged
+            or key is None
+        ):
+            return
+        if mxfp4_to_fp32 is None:
+            raise RuntimeError("MXFP4 cache error logging requires Triton")
+
+        flat_slots = slot_mapping.reshape(-1)
+        valid_indices = torch.nonzero(flat_slots >= 0, as_tuple=False).reshape(-1)
+        if valid_indices.numel() == 0:
+            return
+
+        valid_slots = flat_slots.index_select(0, valid_indices).to(torch.long)
+        storage_block_size = key_cache.shape[1]
+        block_indices = torch.div(
+            valid_slots,
+            storage_block_size,
+            rounding_mode="floor",
+        )
+        block_offsets = torch.remainder(valid_slots, storage_block_size)
+        cached_key = key_cache[block_indices, block_offsets].contiguous()
+        cached_scale = scale_cache[block_indices, block_offsets].contiguous()
+        dequantized_key = mxfp4_to_fp32(cached_key, cached_scale)
+        reference_key = key.index_select(0, valid_indices).float()
+
+        # Compute the reporting metrics on CPU to keep the debug path portable
+        # and to perform only two explicit device-to-host synchronizations.
+        reference_cpu = reference_key.cpu()
+        dequantized_cpu = dequantized_key.float().cpu()
+        difference = dequantized_cpu - reference_cpu
+        absolute_error = difference.abs()
+        reference_norm = torch.linalg.vector_norm(reference_cpu)
+        error_norm = torch.linalg.vector_norm(difference)
+        relative_l2 = error_norm / reference_norm.clamp_min(torch.finfo(torch.float32).tiny)
+
+        reference_flat = reference_cpu.reshape(reference_cpu.shape[0], -1)
+        dequantized_flat = dequantized_cpu.reshape(dequantized_cpu.shape[0], -1)
+        cosine_denominator = torch.linalg.vector_norm(
+            reference_flat,
+            dim=1,
+        ) * torch.linalg.vector_norm(dequantized_flat, dim=1)
+        cosine = torch.where(
+            cosine_denominator > 0,
+            (reference_flat * dequantized_flat).sum(dim=1) / cosine_denominator,
+            torch.ones_like(cosine_denominator),
+        ).mean()
+
+        self._mxfp4_cache_error_logged = True
+        logger.info(
+            "MXFP4 cache round-trip [%s]: tokens=%d, values=%d, "
+            "MAE=%.8e, RMSE=%.8e, P99_abs=%.8e, max_abs=%.8e, "
+            "relative_L2=%.8e, cosine=%.8f, input_abs_max=%.8e, "
+            "dequant_abs_max=%.8e",
+            self.debug_name or "unnamed-indexer",
+            reference_cpu.shape[0],
+            reference_cpu.numel(),
+            absolute_error.mean().item(),
+            difference.square().mean().sqrt().item(),
+            torch.quantile(absolute_error.reshape(-1), 0.99).item(),
+            absolute_error.max().item(),
+            relative_l2.item(),
+            cosine.item(),
+            reference_cpu.abs().max().item(),
+            dequantized_cpu.abs().max().item(),
+        )
 
     def _get_e2m1_half_unit_lut(self, device: torch.device) -> torch.Tensor:
         if create_e2m1_half_unit_lut is None:
@@ -239,7 +339,7 @@ class AscendIndexerOps:
         slot_mapping: torch.Tensor,
     ):
         if self.use_mxfp4:
-            return self.device_operator.indexer_quant_scatter_part1(
+            result = self.device_operator.indexer_quant_scatter_part1(
                 key,
                 key_cache,
                 full_cache,
@@ -247,6 +347,13 @@ class AscendIndexerOps:
                 indexer_scale_cache=scale_cache,
                 use_mxfp4=True,
             )
+            self._log_mxfp4_cache_roundtrip_error(
+                key,
+                key_cache,
+                scale_cache,
+                slot_mapping,
+            )
+            return result
         return self.device_operator.indexer_quant_scatter_part1(
             key,
             key_cache,
@@ -343,6 +450,12 @@ class AscendIndexerOps:
                 slot_mapping,
                 use_mxfp4=True,
             )
+            self._log_mxfp4_cache_roundtrip_error(
+                key,
+                key_cache,
+                scale_cache,
+                slot_mapping,
+            )
         else:
             query, query_scale, _, _ = self.device_operator.indexer_quant_scatter(
                 query,
@@ -387,6 +500,7 @@ class DeepseekV4Indexer(nn.Module):
         self.compress_ratio = compress_ratio
         self.skip_topk = skip_topk
         self.use_index_cache = use_index_cache
+        mxfp4_indexer_enabled = getattr(config, "use_mxfp4_indexer", True)
 
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
@@ -404,15 +518,31 @@ class DeepseekV4Indexer(nn.Module):
         self.use_mxfp4 = _use_mxfp4_indexer(
             self.compress_ratio,
             self.head_dim,
+            enabled=mxfp4_indexer_enabled,
         )
         if self.use_mxfp4:
             logger.info_once(
                 "DeepSeek V4 C4 Indexer runtime MXFP4 path enabled "
                 "(E2M1 packed uint8, E8M0 group-32 scales)."
             )
+        elif (
+            not mxfp4_indexer_enabled
+            and self.compress_ratio == 4
+            and self.head_dim == MXFP4_INDEXER_HEAD_DIM
+        ):
+            logger.info_once(
+                "DeepSeek V4 C4 Indexer runtime MXFP4 path disabled by "
+                "use_mxfp4_indexer=false; using the legacy cache and QK path."
+            )
         self.ops = AscendIndexerOps(
             index_topk=self.index_topk,
             use_mxfp4=self.use_mxfp4,
+            debug_mxfp4_cache_error=getattr(
+                config,
+                "debug_mxfp4_cache_error",
+                False,
+            ),
+            debug_name=prefix,
         )
         self.weights_proj = ReplicatedLinear(
             config.hidden_size,

@@ -15,10 +15,12 @@ from vllm_ascend.models.deepseek_v4.indexer import (
     AscendIndexerOps,
     DeepseekV4Indexer,
     IndexerOverlapPlan,
+    _use_mxfp4_indexer,
     hadamard_linear,
     hadamard_scale,
     rotate_activation,
 )
+from vllm_ascend.utils import AscendDeviceType
 
 
 def _make_indexer(topk_indices_buffer: torch.Tensor | None) -> DeepseekV4Indexer:
@@ -369,6 +371,85 @@ class TestIndexerForward:
 
 
 class TestIndexerOps:
+    def test_mxfp4_feature_switch_can_force_legacy_path(self):
+        with (
+            patch(
+                "vllm_ascend.models.deepseek_v4.indexer.HAS_TRITON",
+                True,
+            ),
+            patch(
+                "vllm_ascend.models.deepseek_v4.indexer.get_ascend_device_type",
+                return_value=AscendDeviceType.A5,
+            ),
+            patch(
+                "vllm_ascend.models.deepseek_v4.indexer.enable_dsa_cp",
+                return_value=False,
+            ),
+        ):
+            assert _use_mxfp4_indexer(4, 128)
+            assert not _use_mxfp4_indexer(4, 128, enabled=False)
+
+    def test_mxfp4_cache_roundtrip_error_reads_real_slots_once(self):
+        indexer_ops = AscendIndexerOps(
+            index_topk=3,
+            use_mxfp4=True,
+            debug_mxfp4_cache_error=True,
+            debug_name="model.layers.0.indexer",
+        )
+        key = torch.tensor(
+            [
+                [[1.0, 2.0]],
+                [[3.0, 4.0]],
+            ]
+        )
+        key_cache = torch.tensor(
+            [
+                [[[10]], [[11]]],
+                [[[12]], [[13]]],
+            ],
+            dtype=torch.uint8,
+        )
+        scale_cache = torch.tensor(
+            [
+                [[[20]], [[21]]],
+                [[[22]], [[23]]],
+            ],
+            dtype=torch.uint8,
+        )
+        slot_mapping = torch.tensor([3, 0], dtype=torch.int32)
+        dequantized = key + 0.25
+
+        with (
+            patch(
+                "vllm_ascend.models.deepseek_v4.indexer.mxfp4_to_fp32",
+                return_value=dequantized,
+            ) as dequantize,
+            patch(
+                "vllm_ascend.models.deepseek_v4.indexer.logger.info",
+            ) as log_info,
+        ):
+            indexer_ops._log_mxfp4_cache_roundtrip_error(
+                key,
+                key_cache,
+                scale_cache,
+                slot_mapping,
+            )
+            indexer_ops._log_mxfp4_cache_roundtrip_error(
+                key,
+                key_cache,
+                scale_cache,
+                slot_mapping,
+            )
+
+        dequantize.assert_called_once()
+        cached_key, cached_scale = dequantize.call_args.args
+        assert torch.equal(cached_key, torch.tensor([[[13]], [[10]]], dtype=torch.uint8))
+        assert torch.equal(cached_scale, torch.tensor([[[23]], [[20]]], dtype=torch.uint8))
+        log_info.assert_called_once()
+        assert log_info.call_args.args[1] == "model.layers.0.indexer"
+        assert log_info.call_args.args[2] == 2
+        assert log_info.call_args.args[3] == 4
+
     def test_quantize_scatter_then_select_topk(self):
         indexer_ops = AscendIndexerOps(index_topk=3)
         key_cache = torch.empty((1, 1, 1, 4), dtype=torch.int8)

@@ -399,7 +399,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         hf_config = self.model_config.hf_config
         self.uses_mxfp4_indexer = (
             hf_config.model_type == "deepseek_v4"
-            and _use_mxfp4_indexer(4, hf_config.index_head_dim)
+            and _use_mxfp4_indexer(
+                4,
+                hf_config.index_head_dim,
+                enabled=getattr(hf_config, "use_mxfp4_indexer", True),
+            )
         )
         self.hadamard = None
         self._init_hadamard(layer_names)
