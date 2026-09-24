@@ -168,7 +168,12 @@ class AscendDSAV41CPImpl(AscendDSAV41Impl):
                 rotary_mode="interleave",
                 partial_slice=[attn.nope_head_dim, attn.head_dim],
             )
-            scatter_cache_sk(attn.dsa_attn.swa_cache_layer.kv_cache[0], swa_metadata.slot_mapping, kv.squeeze(1))
+            scatter_cache_sk(
+                attn.dsa_attn.swa_cache_layer.kv_cache[0],
+                swa_metadata.slot_mapping,
+                kv.squeeze(1),
+                fake_quant_int4=self.fa_fake_quant_int4,
+            )
         q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias).unflatten(-1, (attn.n_heads, attn.head_dim))
         main_stream.wait_stream(aux_stream)
         torch.ops._C_ascend.inplace_partial_rotary_mul(

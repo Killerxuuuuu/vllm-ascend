@@ -36,6 +36,12 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # DeepSeek V4.1 backbone FA Q/K/V INT4 loss simulation. Default: 0 (off).
+    # Valid values: 0 or 1; not sensitive. Per-token/head symmetric [-7, 7]
+    # QDQ after RoPE, floating caches and floating SparseFlashMla. Indexer
+    # and compressor intermediate state are unchanged. Restart all workers
+    # when changing this setting; do not reuse caches across experiments.
+    "VLLM_ASCEND_DSV41_FA_FAKE_INT4": lambda: _strict_binary_env("VLLM_ASCEND_DSV41_FA_FAKE_INT4"),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

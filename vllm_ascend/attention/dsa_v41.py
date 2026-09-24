@@ -17,6 +17,7 @@ from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import (
@@ -27,7 +28,9 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import CircularBufferSpec
 
+from vllm_ascend import envs
 from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
+from vllm_ascend.attention.fa_fake_quant import fake_quantize_int4
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSlidingWindowMLASpec,
@@ -46,6 +49,7 @@ from vllm_ascend.worker.device_metadata import (
 )
 
 V41_METADATA_BUFFER_SIZE = 1024
+logger = init_logger(__name__)
 
 
 @eager_break_during_capture
@@ -208,6 +212,8 @@ def scatter_cache_sk(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     values: torch.Tensor,
+    *,
+    fake_quant_int4: bool = False,
 ) -> None:
     """Store rows using builder-prepared coordinates and V4's Ascend op.
 
@@ -219,6 +225,10 @@ def scatter_cache_sk(
     cache = cache.squeeze(-2)
     indices = slot_mapping[: values.shape[0]]
     updates = values.to(cache.dtype).contiguous()
+    if fake_quant_int4:
+        # Only main-attention cache writers opt in. Indexer and compressor
+        # state users retain their original behavior.
+        updates = fake_quantize_int4(updates)
     torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, indices, updates)
 
 
@@ -239,6 +249,14 @@ class AscendDSAV41Impl:
     """
 
     def __init__(self, prefix, role, topology, long_kv_source_prefix, index_k_source_prefix):
+        self.fa_fake_quant_int4 = envs.VLLM_ASCEND_DSV41_FA_FAKE_INT4
+        if self.fa_fake_quant_int4:
+            logger.info(
+                "[FA-FAKE-INT4] %s: Q + shared K/V; per-token/head absmax, "
+                "range=[-7,7], FP32 scale, ties-to-even; post-RoPE QDQ; "
+                "SWA/long KV stores dequantized floats; Indexer unchanged.",
+                prefix,
+            )
         self.prefix = prefix
         self.layer_name = f"{prefix}.attn"
         self.role = role
@@ -284,7 +302,12 @@ class AscendDSAV41Impl:
         positions = metadata.positions[: hidden_states.shape[0]]
         cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
         kv = self._project_kv(attn, hidden_states, cos, sin)
-        scatter_cache_sk(attn.dsa_attn.swa_cache_layer.kv_cache[0], metadata.swa.slot_mapping, kv)
+        scatter_cache_sk(
+            attn.dsa_attn.swa_cache_layer.kv_cache[0],
+            metadata.swa.slot_mapping,
+            kv,
+            fake_quant_int4=self.fa_fake_quant_int4,
+        )
         if self.role.is_kv_source:
             self._write_compressed_source(attn, hidden_states, positions, cos, sin, metadata)
 
@@ -363,6 +386,7 @@ class AscendDSAV41Impl:
                 attn.dsa_attn.swa_cache_layer.kv_cache[0],
                 swa_metadata.slot_mapping,
                 kv.squeeze(1),
+                fake_quant_int4=self.fa_fake_quant_int4,
             )
         q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias).unflatten(-1, (attn.n_local_heads, attn.head_dim))
         main_stream.wait_stream(aux_stream)
@@ -433,6 +457,7 @@ class AscendDSAV41Impl:
             attn.long_kv_cache.kv_cache[0],
             long_slots,
             latent.squeeze(1),
+            fake_quant_int4=self.fa_fake_quant_int4,
         )
 
     def _select_sparse_indices(self, attn, hidden_states, qr, positions, cos, sin, metadata):
@@ -497,6 +522,10 @@ class AscendDSAV41Impl:
             DeviceMetadataStage.ATTENTION,
             id(op_metadata),
         )
+        if self.fa_fake_quant_int4:
+            # q has already passed RoPE. KV caches were QDQ'd once at their
+            # source writes; cross-layer readers must not QDQ them again.
+            q = fake_quantize_int4(q)
         output, _ = torch.ops._C_ascend.npu_sparse_flash_mla(
             q,
             ori_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
