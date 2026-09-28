@@ -30,7 +30,7 @@ from vllm.v1.kv_cache_interface import CircularBufferSpec
 
 from vllm_ascend import envs
 from vllm_ascend.attention.dsa_v1 import build_dspark_swa_indices, dsv4_dsa_overlap_stream
-from vllm_ascend.attention.fa_fake_quant import fake_quantize_int4
+from vllm_ascend.attention.fa_fake_quant import fake_quantize_int4, hadamard_rotate
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSlidingWindowMLASpec,
@@ -214,6 +214,7 @@ def scatter_cache_sk(
     values: torch.Tensor,
     *,
     fake_quant_int4: bool = False,
+    rotate_int4: bool = False,
 ) -> None:
     """Store rows using builder-prepared coordinates and V4's Ascend op.
 
@@ -225,9 +226,13 @@ def scatter_cache_sk(
     cache = cache.squeeze(-2)
     indices = slot_mapping[: values.shape[0]]
     updates = values.to(cache.dtype).contiguous()
+    if rotate_int4 and not fake_quant_int4:
+        raise ValueError("Q/K rotation requires fake INT4 quantization")
     if fake_quant_int4:
         # Only main-attention cache writers opt in. Indexer and compressor
         # state users retain their original behavior.
+        if rotate_int4:
+            updates = hadamard_rotate(updates)
         updates = fake_quantize_int4(updates)
     torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, indices, updates)
 
@@ -250,6 +255,9 @@ class AscendDSAV41Impl:
 
     def __init__(self, prefix, role, topology, long_kv_source_prefix, index_k_source_prefix):
         self.fa_fake_quant_int4 = envs.VLLM_ASCEND_DSV41_FA_FAKE_INT4
+        self.fa_qk_rotation = envs.VLLM_ASCEND_DSV41_FA_QK_ROTATION
+        if self.fa_qk_rotation and not self.fa_fake_quant_int4:
+            raise ValueError("VLLM_ASCEND_DSV41_FA_QK_ROTATION requires VLLM_ASCEND_DSV41_FA_FAKE_INT4=1")
         if self.fa_fake_quant_int4:
             logger.info(
                 "[FA-FAKE-INT4] %s: Q + shared K/V; per-token/head absmax, "
@@ -257,6 +265,8 @@ class AscendDSAV41Impl:
                 "SWA/long KV stores dequantized floats; Indexer unchanged.",
                 prefix,
             )
+        if self.fa_qk_rotation:
+            logger.info("[FA-QK-ROTATION] %s: normalized Hadamard after RoPE, inverse on attention output", prefix)
         self.prefix = prefix
         self.layer_name = f"{prefix}.attn"
         self.role = role
@@ -307,6 +317,7 @@ class AscendDSAV41Impl:
             metadata.swa.slot_mapping,
             kv,
             fake_quant_int4=self.fa_fake_quant_int4,
+            rotate_int4=self.fa_qk_rotation,
         )
         if self.role.is_kv_source:
             self._write_compressed_source(attn, hidden_states, positions, cos, sin, metadata)
@@ -387,6 +398,7 @@ class AscendDSAV41Impl:
                 swa_metadata.slot_mapping,
                 kv.squeeze(1),
                 fake_quant_int4=self.fa_fake_quant_int4,
+                rotate_int4=self.fa_qk_rotation,
             )
         q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias).unflatten(-1, (attn.n_local_heads, attn.head_dim))
         main_stream.wait_stream(aux_stream)
@@ -458,6 +470,7 @@ class AscendDSAV41Impl:
             long_slots,
             latent.squeeze(1),
             fake_quant_int4=self.fa_fake_quant_int4,
+            rotate_int4=self.fa_qk_rotation,
         )
 
     def _select_sparse_indices(self, attn, hidden_states, qr, positions, cos, sin, metadata):
@@ -525,6 +538,8 @@ class AscendDSAV41Impl:
         if self.fa_fake_quant_int4:
             # q has already passed RoPE. KV caches were QDQ'd once at their
             # source writes; cross-layer readers must not QDQ them again.
+            if self.fa_qk_rotation:
+                q = hadamard_rotate(q)
             q = fake_quantize_int4(q)
         output, _ = torch.ops._C_ascend.npu_sparse_flash_mla(
             q,
@@ -552,7 +567,9 @@ class AscendDSAV41Impl:
             topk_value_mode=1,
             return_softmax_lse=False,
         )
-        return output
+        # The K/V cache is shared. Rotating K also rotates V; undo the value
+        # rotation before the existing inverse RoPE and O projection.
+        return hadamard_rotate(output) if self.fa_qk_rotation else output
 
     @staticmethod
     def update_graph_params(*args, **kwargs):

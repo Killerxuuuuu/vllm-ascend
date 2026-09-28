@@ -173,6 +173,7 @@ class AscendDSAV41CPImpl(AscendDSAV41Impl):
                 swa_metadata.slot_mapping,
                 kv.squeeze(1),
                 fake_quant_int4=self.fa_fake_quant_int4,
+                rotate_int4=self.fa_qk_rotation,
             )
         q = wq_b.matmul(q_b_quant, q_b_scale, bias=attn.wq_b.bias).unflatten(-1, (attn.n_heads, attn.head_dim))
         main_stream.wait_stream(aux_stream)

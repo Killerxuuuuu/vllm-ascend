@@ -7,6 +7,30 @@ import torch
 INT4_SYMMETRIC_MAX = 7
 
 
+def hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
+    """Apply a normalized, self-inverse Walsh-Hadamard transform per head.
+
+    Keep the butterfly in FP32 so rotating BF16 Q/K/V does not accumulate
+    rounding error at every stage. The last dimension must be a power of two.
+    """
+    if x.ndim == 0:
+        raise ValueError("Hadamard rotation requires a nonempty last dimension")
+    width = x.shape[-1]
+    if width == 0 or width & (width - 1):
+        raise ValueError(f"Hadamard rotation requires a power-of-two head dimension, got {width}")
+    if x.numel() == 0:
+        return x.clone()
+
+    result = x.float()
+    stride = 1
+    while stride < width:
+        pairs = result.reshape(*x.shape[:-1], width // (2 * stride), 2, stride)
+        left, right = pairs.unbind(dim=-2)
+        result = torch.stack((left + right, left - right), dim=-2).reshape(*x.shape)
+        stride *= 2
+    return (result * (width**-0.5)).to(x.dtype)
+
+
 def fake_quantize_int4(x: torch.Tensor) -> torch.Tensor:
     """Round each last-axis vector to symmetric INT4, then dequantize.
 

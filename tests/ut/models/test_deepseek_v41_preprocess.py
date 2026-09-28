@@ -95,7 +95,7 @@ def test_preprocess_equivalence_and_stream_dependencies(monkeypatch, share_quant
         assert x.shape[0] == cos.shape[0] == sin.shape[0]
         x[..., start:end].mul_(cos).add_(sin)
 
-    def scatter(cache, slots, values):
+    def scatter(cache, slots, values, **_kwargs):
         trace.append((active, "cache", "scatter"))
         for slot, value in zip(slots, values):
             if slot[0] >= 0:
@@ -141,6 +141,8 @@ def test_preprocess_equivalence_and_stream_dependencies(monkeypatch, share_quant
     start = num_tokens // 2 if cp else 0
     local_hidden, local_cos, local_sin = hidden[start:], cos[start:], sin[start:]
     impl = object.__new__(dsa_v41_cp.AscendDSAV41CPImpl if cp else dsa_v41.AscendDSAV41Impl)
+    impl.fa_fake_quant_int4 = False
+    impl.fa_qk_rotation = False
     expected_qr = attn.q_norm(attn.wq_a(local_hidden))
     expected_q = attn.wq_b(expected_qr).unflatten(-1, (attn.n_heads, attn.head_dim))
     rope(expected_q.unsqueeze(1), local_cos, local_sin, partial_slice=[attn.nope_head_dim, attn.head_dim])

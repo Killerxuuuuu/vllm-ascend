@@ -42,6 +42,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # and compressor intermediate state are unchanged. Restart all workers
     # when changing this setting; do not reuse caches across experiments.
     "VLLM_ASCEND_DSV41_FA_FAKE_INT4": lambda: _strict_binary_env("VLLM_ASCEND_DSV41_FA_FAKE_INT4"),
+    # Rotate post-RoPE V4.1 FA Q and shared K/V with the same normalized
+    # Hadamard transform before fake INT4 QDQ, then invert the attention
+    # output rotation. Default: 0 (off); valid values: 0 or 1; not sensitive.
+    # Requires VLLM_ASCEND_DSV41_FA_FAKE_INT4=1. Restart all workers and
+    # discard their caches when changing this setting.
+    "VLLM_ASCEND_DSV41_FA_QK_ROTATION": lambda: _strict_binary_env("VLLM_ASCEND_DSV41_FA_QK_ROTATION"),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

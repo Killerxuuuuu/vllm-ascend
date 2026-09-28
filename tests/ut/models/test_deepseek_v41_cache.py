@@ -39,6 +39,7 @@ from vllm_ascend.attention.dsa_v41 import (
     pad_sparse_indices,
     scatter_cache_sk,
 )
+from vllm_ascend.attention.fa_fake_quant import fake_quantize_int4, hadamard_rotate
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSlidingWindowMLASpec,
@@ -545,6 +546,68 @@ def test_scatter_cache_sk_consumes_prepared_coordinates_and_preserves_stride(
     assert actual_indices.data_ptr() == indices.data_ptr()
     torch.testing.assert_close(actual_indices, indices)
     assert updates.tolist() == [[9.0, 9.0], [7.0, 8.0]]
+
+
+def test_scatter_cache_sk_rotates_before_fake_quant(monkeypatch):
+    cache = torch.zeros((1, 1, 1, 8), dtype=torch.float32)
+    indices = torch.zeros((1, 2), dtype=torch.int32)
+    values = torch.tensor([[10.0, 0.5, -1.0, 2.0, 0.0, 3.0, 1.0, -0.5]])
+    updates = []
+    monkeypatch.setattr(
+        torch.ops._C_ascend,
+        "npu_scatter_nd_update_sk",
+        lambda _cache, _indices, value: updates.append(value),
+        raising=False,
+    )
+
+    scatter_cache_sk(cache, indices, values, fake_quant_int4=True, rotate_int4=True)
+
+    torch.testing.assert_close(updates[0], fake_quantize_int4(hadamard_rotate(values)))
+    with pytest.raises(ValueError, match="requires fake INT4"):
+        scatter_cache_sk(cache, indices, values, rotate_int4=True)
+
+
+@pytest.mark.parametrize("rotate", [False, True])
+def test_v41_attention_rotates_query_and_restores_shared_value(monkeypatch, rotate):
+    impl = object.__new__(AscendDSAV41Impl)
+    impl.fa_fake_quant_int4 = True
+    impl.fa_qk_rotation = rotate
+    impl.role = SimpleNamespace(has_long_context=False, compress_ratio=0)
+    q = torch.randn(1, 2, 8)
+    expected_output = torch.randn_like(q)
+    native_output = hadamard_rotate(expected_output) if rotate else expected_output
+    recorded_queries = []
+
+    def native_attention(query, **_kwargs):
+        recorded_queries.append(query)
+        return native_output, None
+
+    monkeypatch.setattr(dsa_v41, "wait_for_device_metadata", lambda *_args: None)
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_mla", native_attention, raising=False)
+    swa = SimpleNamespace(
+        num_reqs=1,
+        query_start_loc=torch.tensor([0, 1]),
+        seq_lens=torch.tensor([1]),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        smla_metadata=torch.zeros(1, dtype=torch.int32),
+        ori_sparse_indices=None,
+        ori_topk_length=None,
+        ori_mask_mode=0,
+        ori_win_left=0,
+        ori_win_right=0,
+    )
+    metadata = SimpleNamespace(swa=swa, attention=None)
+    attn = SimpleNamespace(
+        attn_sink=None,
+        softmax_scale=1.0,
+        dsa_attn=SimpleNamespace(swa_cache_layer=SimpleNamespace(kv_cache=[torch.empty(0)])),
+    )
+
+    result = impl._forward_attention(attn, q, metadata, compressed_indices=None)
+
+    expected_query = fake_quantize_int4(hadamard_rotate(q) if rotate else q)
+    torch.testing.assert_close(recorded_queries[0], expected_query)
+    torch.testing.assert_close(result, expected_output, rtol=1e-4, atol=1e-4)
 
 
 def test_compression_slot_mapping():
