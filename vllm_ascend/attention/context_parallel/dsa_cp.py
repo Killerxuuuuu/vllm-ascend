@@ -1482,6 +1482,19 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
                     )
                 o = o.reshape(num_tokens, -1)
                 local_output = self._apply_wo_b(o, full_gather_wo_a_enabled)
+            elif (
+                get_ascend_device_type() == AscendDeviceType.A3
+                and dsa_v1._is_w8a8_dynamic(self.wo_a)
+                and self.wo_a.weight.dtype == torch.int8
+                and not olora_tp_enable()
+            ):
+                o = o_proj_input.view(num_tokens, o_proj_groups, -1)
+                o = dsa_v1._a3_int8_grouped_wo_a(
+                    o,
+                    self._get_batched_wo_a_weight(o_proj_groups),
+                    self._get_batched_wo_a_scale(o_proj_groups),
+                )
+                local_output = self._apply_wo_b(o.reshape(num_tokens, -1), full_gather_wo_a_enabled)
             else:
                 o_proj_input = o_proj_input.view(num_tokens, o_proj_groups, -1)
                 if olora_tp_enable():

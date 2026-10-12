@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash A3：`wo_a`/`wo_b` INT8 QBMM 可行性验证
 
-这一步只验证算子拼接与量化权重是否兼容，不修改 vLLM 的 DSA 正式路径，也不代表整网精度或性能已经通过。对象是 **DeepSeek V4 Flash，不是 V4.1 Flash**。
+本实验先验证算子拼接与量化权重兼容性，再将 `wo_a` 的 A3 INT8 路径接入 vLLM DSA。代码接入不代表整网精度或性能已经通过。对象是 **DeepSeek V4 Flash，不是 V4.1 Flash**。
 
 现有 `dsa_v1.py` 的 A5 路径用 FP8 `npu_transpose_quant_batchmatmul`；A3 的 BF16 路径用 `npu_transpose_batchmatmul`。以下区分 **0731 正式版**与旧的 **preview 版**配置；两者不能混用。目标 W8A8 配置的激活采用 per-token 对称 INT8，权重采用 per-channel 对称 INT8。
 
@@ -24,7 +24,20 @@ export CFG_0731="$CFG_DIR/deepseek_v4_flash_0731_a3_w8a8_int8_with_wo_experiment
   --output "$CFG_0731"
 ```
 
-生成器不会覆盖已有输出。做 `wo_a`/`wo_b` 精度影响对照时，再用同一模板加 `--exclude-wo` 生成第二份配置；其余量化设置保持一致。**本步只生成 YAML，不导出权重，也不表示 vLLM A3 已能加载量化后的 `wo_a`。** 下一步应先校验 ModelSlim 能解析该 YAML，然后量化导出、检查权重与 scale，最后接入 A3 QBMM 路径。
+生成器不会覆盖已有输出。做 `wo_a`/`wo_b` 精度影响对照时，再用同一模板加 `--exclude-wo` 生成第二份配置；其余量化设置保持一致。**本步只生成 YAML，不导出权重。** ModelSlim 导出后须检查量化描述、INT8 权重和 scale，再做运行时验证。
+
+## A3 DSA 运行时接入
+
+`dsa_v1.py` 与 DSA-CP 在检测到 A3、`wo_a` 为 `W8A8_DYNAMIC` 且权重为 INT8 时，按 group 执行激活动态 per-token INT8 量化和 2-D `npu_quant_matmul`。`wo_a` 的 per-channel scale 随分组使用；`wo_b` 继续走现有 W8A8 Linear 方法。A5 FP8 与 A3 BF16 路径保持不变。这个分组循环是功能验证路径，**不能当作最终融合算子的性能数据**。
+
+服务启动前，先确认容器实际导入的是包含此修改的源码；宿主机 `/home/x50063292/vllm-ascend` 的变更不会自动出现在镜像内 `/vllm-workspace/vllm-ascend`：
+
+```bash
+python -c 'import vllm_ascend; print(vllm_ascend.__file__)'
+python -m pytest -q tests/ut/attention/test_dsa_v1.py -k 'a3_int8 or a5_bf16'
+```
+
+要使用 16 张卡和 `o_groups=8` 的模型，服务侧应采用 **TP8 × DP2**，不要设 TP16（每个 TP rank 至少要有一个 o-proj group）。服务启动时使用 ModelSlim 导出的量化模型目录，保留 `--quantization ascend`。是否能完整加载、推理和达到预期精度，仍需在 A3 上实际验证。
 
 ## Preview 版：原有单算子探针流程
 
@@ -76,7 +89,7 @@ python tools/dsv4_a3_wo/qbmm_probe.py \
 
 `wo_a` 计算为每组一次 `[T,K] INT8 @ transpose([R,K] INT8)`，然后按原 group 顺序拼回 `[T,G*R]`；`wo_b` 再做 `[T,G*R] INT8 @ transpose([D,G*R] INT8)`。两次都用 `npu_dynamic_quant` 生成激活 INT8 和 per-token scale，QBMM 使用 ModelSlim 导出的 per-channel weight scale，输出 BF16。报告分别给出两层 QBMM 与“相同 INT8 数据和 scale 的浮点反量化矩阵乘”之间的最大绝对误差、归一化 RMSE 和余弦相似度。
 
-这里使用循环 2-D QBMM 是为了先验证 A3 接口与数值路径；**循环开销不可用于代表最终 fused batchmatmul 性能**。通过后再做 DSA 权重加载适配、批量算子/图捕获与整网精度评估。
+这里使用循环 2-D QBMM 是为了先验证 A3 接口与数值路径；**循环开销不可用于代表最终 fused batchmatmul 性能**。接入后的 DSA 路径仍需测试权重加载、图捕获与整网精度。
 
 ### 3. 结果判读
 

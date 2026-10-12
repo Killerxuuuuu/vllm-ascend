@@ -35,6 +35,7 @@ from vllm_ascend.attention.dsa_v1 import (
     AscendDSAMetadata,
     AscendDSAMetadataBuilder,
     AscendDSAReqMetadata,
+    _a3_int8_grouped_wo_a,
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.deepseek_v4.compressor import AscendCompressorMetadata
@@ -43,6 +44,7 @@ from vllm_ascend.models.deepseek_v4.indexer import (
     IndexerOverlapPlan,
 )
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import AscendDeviceType
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 
@@ -661,6 +663,88 @@ def test_a5_bf16_o_proj_does_not_require_weight_scale():
     assert torch.equal(actual, expected)
     dynamic_quant.assert_not_called()
     impl.wo_b.assert_called_once()
+
+
+def test_a3_int8_grouped_wo_a_uses_per_token_and_per_channel_scales():
+    activations = torch.tensor([[[2.0, 4.0], [6.0, 8.0]]])
+    weight = torch.tensor([[[1, 2], [3, 4]], [[5, 6], [7, 8]]], dtype=torch.int8)
+    weight_scale = torch.tensor([[0.5, 1.0], [1.5, 2.0]])
+
+    def fake_dynamic_quant(x, dst_type):
+        assert dst_type == torch.int8
+        return (x / 2).to(torch.int8), torch.full((x.shape[0], 1), 2.0)
+
+    def fake_quant_matmul(x, w, scale, *, pertoken_scale, output_dtype):
+        assert x.dtype == w.dtype == torch.int8
+        return ((x.float() @ w.float()) * pertoken_scale[:, None] * scale[None, :]).to(output_dtype)
+
+    with (
+        patch.object(torch_npu, "npu_dynamic_quant", side_effect=fake_dynamic_quant) as dynamic_quant,
+        patch.object(torch_npu, "npu_quant_matmul", side_effect=fake_quant_matmul) as qbmm,
+    ):
+        actual = _a3_int8_grouped_wo_a(activations, weight, weight_scale)
+
+    expected = torch.stack(
+        [activations[:, group] @ weight[group].float() * weight_scale[group] for group in range(2)],
+        dim=1,
+    )
+    torch.testing.assert_close(actual, expected)
+    assert dynamic_quant.call_count == qbmm.call_count == 2
+
+
+def test_a3_int8_grouped_wo_a_rejects_incompatible_scale():
+    with pytest.raises(ValueError, match="one scale per output channel"):
+        _a3_int8_grouped_wo_a(
+            torch.ones(1, 2, 4),
+            torch.ones(2, 4, 3, dtype=torch.int8),
+            torch.ones(5),
+        )
+
+
+def test_a3_int8_grouped_wo_a_rejects_zero_local_groups():
+    with pytest.raises(ValueError, match="at least one group"):
+        _a3_int8_grouped_wo_a(
+            torch.empty(1, 0, 4),
+            torch.empty(0, 4, 3, dtype=torch.int8),
+            torch.empty(0),
+        )
+
+
+def test_a3_int8_o_proj_uses_qbmm_after_weight_loading():
+    impl = _make_impl()
+    impl.n_local_groups = 2
+    # W8A8 process_weights_after_loading transposes [G*R, K] to [K, G*R].
+    weight = torch.tensor([[1, 3, 5, 7], [2, 4, 6, 8]], dtype=torch.int8)
+    impl.wo_a = SimpleNamespace(
+        weight=weight,
+        weight_scale=torch.tensor([0.5, 1.0, 1.5, 2.0]),
+        quant_method=SimpleNamespace(quant_method=AscendW8A8DynamicLinearMethod()),
+    )
+    impl.wo_b = MagicMock(side_effect=lambda value: value)
+    o_proj_input = torch.tensor([[[2.0, 4.0], [6.0, 8.0]]])
+    output = torch.empty((1, 4))
+
+    def fake_dynamic_quant(x, dst_type):
+        return x.to(dst_type), torch.ones(x.shape[0], 1)
+
+    def fake_quant_matmul(x, w, scale, *, pertoken_scale, output_dtype):
+        return ((x.float() @ w.float()) * pertoken_scale[:, None] * scale[None, :]).to(output_dtype)
+
+    with (
+        patch("vllm_ascend.attention.dsa_v1.get_ascend_device_type", return_value=AscendDeviceType.A3),
+        patch("vllm_ascend.attention.dsa_v1.oproj_tp_enable", return_value=False),
+        patch("vllm_ascend.attention.dsa_v1.olora_tp_enable", return_value=False),
+        patch.object(torch_npu, "npu_dynamic_quant", side_effect=fake_dynamic_quant),
+        patch.object(torch_npu, "npu_quant_matmul", side_effect=fake_quant_matmul) as qbmm,
+        patch.object(torch_npu, "npu_transpose_batchmatmul") as bf16_matmul,
+    ):
+        actual = impl._forward_o_proj(o_proj_input, output)
+
+    expected = torch.tensor([[5.0, 22.0, 117.0, 212.0]])
+    assert actual is output
+    torch.testing.assert_close(actual, expected)
+    assert qbmm.call_count == 2
+    bf16_matmul.assert_not_called()
 
 
 def test_forward_runs_mixed_prefill_and_decode_in_one_attention_call():

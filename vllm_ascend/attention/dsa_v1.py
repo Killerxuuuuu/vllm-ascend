@@ -81,8 +81,50 @@ def _is_w8a8_dynamic(linear) -> bool:
     quant_method = getattr(linear, "quant_method", None)
     if quant_method is None or isinstance(quant_method, AscendUnquantizedLinearMethod):
         return False
-    inner_method = getattr(quant_method, "quant_method", None)
+    inner_method = getattr(quant_method, "quant_method", quant_method)
     return isinstance(inner_method, AscendW8A8DynamicLinearMethod)
+
+
+def _a3_int8_grouped_wo_a(
+    activations: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Run grouped wo_a as per-token INT8 quantization plus 2-D QBMM.
+
+    The A3 path does not have the A5 batched quantized matmul. Keep the group
+    dimension explicit so each QBMM receives a per-channel weight scale.
+    """
+    if activations.ndim != 3 or weight.ndim != 3 or weight.dtype != torch.int8:
+        raise ValueError("A3 INT8 wo_a expects [tokens, groups, input] and [groups, input, rank] INT8")
+    num_tokens, num_groups, input_size = activations.shape
+    if num_groups == 0:
+        raise ValueError("A3 INT8 wo_a requires at least one group per tensor-parallel rank")
+    if weight.shape[:2] != (num_groups, input_size):
+        raise ValueError(
+            "A3 INT8 wo_a activation/weight shapes do not match: "
+            f"{tuple(activations.shape)} and {tuple(weight.shape)}"
+        )
+    if weight_scale.numel() != num_groups * weight.shape[2]:
+        raise ValueError(
+            "A3 INT8 wo_a needs one scale per output channel: "
+            f"weight_shape={tuple(weight.shape)}, scale_shape={tuple(weight_scale.shape)}"
+        )
+
+    scales = weight_scale.reshape(num_groups, -1)
+    outputs = []
+    for group in range(num_groups):
+        x_int8, x_scale = torch_npu.npu_dynamic_quant(activations[:, group, :].contiguous(), dst_type=torch.int8)
+        outputs.append(
+            torch_npu.npu_quant_matmul(
+                x_int8,
+                weight[group].contiguous(),
+                scales[group].float().contiguous(),
+                pertoken_scale=x_scale.reshape(num_tokens).float(),
+                output_dtype=activations.dtype,
+            )
+        )
+    return torch.stack(outputs, dim=1)
 
 
 class AscendDSABackend(AttentionBackend):
@@ -1162,7 +1204,13 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         # A5 (Ascend950) supports both BF16 and FP8 checkpoints. Only the FP8
         # linear method creates weight_scale; BF16 must use the ordinary
         # batched matmul instead of being forced through dynamic MX quant.
-        if get_ascend_device_type() in {AscendDeviceType.A5}:
+        device_type = get_ascend_device_type()
+        a3_int8_wo_a = (
+            device_type == AscendDeviceType.A3
+            and _is_w8a8_dynamic(self.wo_a)
+            and self.wo_a.weight.dtype == torch.int8
+        )
+        if device_type == AscendDeviceType.A5:
             o = o_proj_input
             linear_method = getattr(
                 self.wo_a.quant_method,
@@ -1234,16 +1282,23 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             send[:, :num_tokens].copy_(o_proj_input.transpose(1, 0))
             dist.all_to_all_single(recv.view(-1), send.view(-1), group=oproj_group.device_group)
             o_proj_input = recv.view(oproj_tp_size * exchange_num_tokens, groups_per_rank, group_hidden_dim)
-            o_proj_input = torch_npu.npu_transpose_batchmatmul(
-                o_proj_input,
-                self.wo_a.weight,
-                bias=None,
-                scale=None,
-                perm_x1=(1, 0, 2),
-                perm_x2=(0, 1, 2),
-                perm_y=(1, 0, 2),
-                batch_split_factor=1,
-            )
+            if a3_int8_wo_a:
+                o_proj_input = _a3_int8_grouped_wo_a(
+                    o_proj_input,
+                    self._get_batched_wo_a_weight(groups_per_rank),
+                    self._get_batched_wo_a_scale(groups_per_rank),
+                )
+            else:
+                o_proj_input = torch_npu.npu_transpose_batchmatmul(
+                    o_proj_input,
+                    self.wo_a.weight,
+                    bias=None,
+                    scale=None,
+                    perm_x1=(1, 0, 2),
+                    perm_x2=(0, 1, 2),
+                    perm_y=(1, 0, 2),
+                    batch_split_factor=1,
+                )
             o_proj_input = o_proj_input.reshape(oproj_tp_size * exchange_num_tokens, -1)
             o_proj_output = self.wo_b(o_proj_input)
             # reduce_scatter via a raw dist collective into an address-stable
@@ -1263,16 +1318,23 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             o_proj_input = self.wo_a(o_proj_input)
             output[...] = self.wo_b(o_proj_input)
         else:
-            o_proj_input = torch_npu.npu_transpose_batchmatmul(
-                o_proj_input,
-                self.wo_a.weight,
-                bias=None,
-                scale=None,
-                perm_x1=(1, 0, 2),
-                perm_x2=(0, 1, 2),
-                perm_y=(1, 0, 2),
-                batch_split_factor=1,
-            )
+            if a3_int8_wo_a:
+                o_proj_input = _a3_int8_grouped_wo_a(
+                    o_proj_input,
+                    self._get_batched_wo_a_weight(self.n_local_groups),
+                    self._get_batched_wo_a_scale(self.n_local_groups),
+                )
+            else:
+                o_proj_input = torch_npu.npu_transpose_batchmatmul(
+                    o_proj_input,
+                    self.wo_a.weight,
+                    bias=None,
+                    scale=None,
+                    perm_x1=(1, 0, 2),
+                    perm_x2=(0, 1, 2),
+                    perm_y=(1, 0, 2),
+                    batch_split_factor=1,
+                )
             o_proj_input = o_proj_input.reshape(num_tokens, -1)
             output[...] = self.wo_b(o_proj_input)
         return output
