@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+import torch
 from torch import nn
 
 from vllm_ascend.models.deepseek_v4 import model as deepseek_v4
@@ -8,6 +10,40 @@ from vllm_ascend.models.deepseek_v4 import model as deepseek_v4
 class StubModule(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
+
+
+@pytest.mark.parametrize("result_count", [3, 4])
+def test_hc_pre_accepts_both_operator_signatures(monkeypatch, result_count):
+    layer = deepseek_v4.DeepseekV2DecoderLayer.__new__(deepseek_v4.DeepseekV2DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.hc_mult = 4
+    layer.hc_sinkhorn_iters = 20
+    layer.norm_eps = 1e-6
+    layer.hc_eps = 1e-6
+
+    x, hc_fn, hc_scale, hc_base = (torch.empty(1) for _ in range(4))
+    outputs = tuple(torch.empty(1) for _ in range(result_count))
+    calls = []
+
+    def fake_hc_pre(*args, **kwargs):
+        calls.append((args, kwargs))
+        return outputs
+
+    monkeypatch.setattr(deepseek_v4.torch.ops._C_ascend, "npu_hc_pre_v2", fake_hc_pre, raising=False)
+
+    result = layer.hc_pre(x, hc_fn, hc_scale, hc_base)
+
+    assert len(result) == 3
+    assert all(actual is expected for actual, expected in zip(result, outputs[:3]))
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert all(actual is expected for actual, expected in zip(args, (x, hc_fn, hc_scale, hc_base)))
+    assert kwargs == {
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "norm_eps": 1e-6,
+        "hc_eps": 1e-6,
+    }
 
 
 def test_routed_moe_receives_configured_swiglu_limit(monkeypatch):
