@@ -65,6 +65,40 @@ class TestAscendW8A8DynamicLinearMethod(TestBase):
         self.assertEqual(layer.weight_offset.data.shape, (256,))
         self.assertEqual(layer.weight.data.shape, (256, 128))
 
+    def test_process_grouped_wo_a_keeps_int8_weight_in_nd(self):
+        layer = SimpleNamespace()
+        layer.prefix = "model.layers.0.self_attn.wo_a"
+        layer.skip_weight_nz_conversion = True
+        layer.n_local_groups = 2
+        layer.o_lora_rank = 3
+        original_weight = torch.arange(24, dtype=torch.int8).reshape(6, 4)
+        layer.weight = torch.nn.Parameter(original_weight.clone(), requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(torch.ones(6, 1, dtype=torch.bfloat16), requires_grad=False)
+        layer.weight_offset = torch.nn.Parameter(torch.zeros(6, 1, dtype=torch.bfloat16), requires_grad=False)
+
+        with patch(
+            "vllm_ascend.quantization.methods.w8a8.w8a8_dynamic.maybe_trans_nz",
+            side_effect=AssertionError("grouped wo_a must stay in ND format"),
+        ):
+            self.method.process_weights_after_loading(layer)
+
+        self.assertEqual(layer.weight.shape, (2, 4, 3))
+        torch.testing.assert_close(layer.weight, original_weight.reshape(2, 3, 4).transpose(1, 2))
+        self.assertEqual(layer.weight_scale.shape, (6,))
+        self.assertEqual(layer.weight_scale_fp32.dtype, torch.float32)
+
+    def test_process_grouped_wo_a_rejects_wrong_output_size(self):
+        layer = SimpleNamespace(
+            prefix="model.layers.0.self_attn.wo_a",
+            skip_weight_nz_conversion=True,
+            n_local_groups=2,
+            o_lora_rank=3,
+            weight=torch.nn.Parameter(torch.empty(5, 4, dtype=torch.int8), requires_grad=False),
+        )
+
+        with self.assertRaisesRegex(ValueError, "Unexpected INT8 wo_a weight shape"):
+            self.method.process_weights_after_loading(layer)
+
 
 class TestAscendW8A8FusedMoEEplbWeights(TestBase):
     num_experts = 8

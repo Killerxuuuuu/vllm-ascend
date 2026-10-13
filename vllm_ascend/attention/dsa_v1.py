@@ -50,6 +50,8 @@ from vllm_ascend.quantization.methods import AscendW8A8DynamicLinearMethod
 from vllm_ascend.quantization.methods.kv_cache.turboquant import is_turboquant
 from vllm_ascend.quantization.methods.kv_cache.turboquant.latent import TurboQuantLatent
 from vllm_ascend.utils import (
+    AscendDeviceType,
+    get_ascend_device_type,
     get_potential_max_tokens,
     npu_stream_switch,
     oproj_tp_enable,
@@ -196,8 +198,44 @@ def _is_w8a8_dynamic(linear) -> bool:
     quant_method = getattr(linear, "quant_method", None)
     if quant_method is None or isinstance(quant_method, AscendUnquantizedLinearMethod):
         return False
-    inner_method = getattr(quant_method, "quant_method", None)
+    inner_method = getattr(quant_method, "quant_method", quant_method)
     return isinstance(inner_method, AscendW8A8DynamicLinearMethod)
+
+
+def _a3_int8_grouped_wo_a(
+    activations: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Compose per-token INT8 quantization and 2-D QBMM for grouped wo_a."""
+    if activations.ndim != 3 or weight.ndim != 3 or weight.dtype != torch.int8:
+        raise ValueError("A3 INT8 wo_a expects [tokens, groups, input] and [groups, input, rank] INT8")
+    num_tokens, num_groups, input_size = activations.shape
+    if num_groups == 0 or weight.shape[:2] != (num_groups, input_size):
+        raise ValueError(
+            "A3 INT8 wo_a activation/weight shapes do not match: "
+            f"{tuple(activations.shape)} and {tuple(weight.shape)}"
+        )
+    if weight_scale.numel() != num_groups * weight.shape[2]:
+        raise ValueError(
+            "A3 INT8 wo_a needs one scale per output channel: "
+            f"weight_shape={tuple(weight.shape)}, scale_shape={tuple(weight_scale.shape)}"
+        )
+
+    scales = weight_scale.reshape(num_groups, -1)
+    outputs = []
+    for group in range(num_groups):
+        quantized_x, x_scale = torch_npu.npu_dynamic_quant(activations[:, group, :].contiguous(), dst_type=torch.int8)
+        outputs.append(
+            torch_npu.npu_quant_matmul(
+                quantized_x,
+                weight[group].contiguous(),
+                scales[group].float().contiguous(),
+                pertoken_scale=x_scale.reshape(num_tokens).float(),
+                output_dtype=activations.dtype,
+            )
+        )
+    return torch.stack(outputs, dim=1)
 
 
 def _has_weight_scale(linear) -> bool:
@@ -1735,7 +1773,9 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         pass
 
     def _wo_a_bmm(self, o_proj_input: torch.Tensor) -> torch.Tensor:
-        """Project grouped activations with FP8 or BF16, preserving the 3D layout."""
+        """Project grouped activations with INT8, FP8, or BF16."""
+        if get_ascend_device_type() == AscendDeviceType.A3 and _is_w8a8_dynamic(self.wo_a):
+            return _a3_int8_grouped_wo_a(o_proj_input, self.wo_a.weight, self.wo_a.weight_scale)
         if self.support_fp8_attention and _has_weight_scale(self.wo_a):
             o_proj_input, act_scale = torch_npu.npu_dynamic_mx_quant(o_proj_input, dst_type=torch.float8_e4m3fn)
             return torch_npu.npu_transpose_quant_batchmatmul(

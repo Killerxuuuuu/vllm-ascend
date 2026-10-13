@@ -134,10 +134,24 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
         return output
 
     def process_weights_after_loading(self, layer):
-        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
-        # cast quantized weight tensors in NZ format for higher inference speed
-        if self.act_quant_type == torch.int8:
-            layer.weight.data = maybe_trans_nz(layer.weight.data)
+        if "wo_a" in layer.prefix and getattr(layer, "skip_weight_nz_conversion", False):
+            # DSV4's grouped o-projection consumes [group, input, rank] directly.
+            # Keep the INT8 weight in ND rather than applying the ordinary
+            # linear method's [input, output] transpose and NZ conversion.
+            num_groups = layer.n_local_groups
+            rank = layer.o_lora_rank
+            weight = layer.weight.data
+            if num_groups <= 0 or weight.ndim != 2 or weight.shape[0] != num_groups * rank:
+                raise ValueError(
+                    "Unexpected INT8 wo_a weight shape "
+                    f"{tuple(weight.shape)}, expected [{num_groups * rank}, input]"
+                )
+            layer.weight.data = weight.reshape(num_groups, rank, -1).transpose(1, 2).contiguous()
+        else:
+            layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+            # Cast quantized weight tensors in NZ format for ordinary linears.
+            if self.act_quant_type == torch.int8:
+                layer.weight.data = maybe_trans_nz(layer.weight.data)
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
         layer.weight_offset.data = layer.weight_offset.data.flatten()

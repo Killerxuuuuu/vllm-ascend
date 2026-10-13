@@ -485,7 +485,7 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         return super().forward(input_)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        if _should_reshape_wo_a_to_3d(self.prefix, loaded_weight.dtype):
+        if param is self.weight and _should_reshape_wo_a_to_3d(self.prefix, loaded_weight.dtype):
             if self.weight.ndim == 2:
                 # Keep the raw 2D layout here. The 2D -> 3D reshape happens in
                 # process_weights_after_loading so it also runs for
