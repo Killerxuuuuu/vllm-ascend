@@ -22,12 +22,19 @@ import torch_npu
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.logger import logger
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import _MEGA_MOE_SUPPORTED, get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.dataclass.fused_experts import build_fused_experts_input
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, enable_dsa_cp, maybe_trans_nz
+from vllm_ascend.utils import (
+    ACL_FORMAT_FRACTAL_NZ,
+    AscendDeviceType,
+    enable_dsa_cp,
+    get_ascend_device_type,
+    maybe_trans_nz,
+)
 
 from .base import (
     AscendLinearScheme,
@@ -155,7 +162,14 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
             del layer.weight_offset
         else:
             # cast quantized weight tensors in NZ format for higher inference speed
-            if self.act_quant_type == torch.int8:
+            triton_wo_a = (
+                "wo_a" in getattr(layer, "prefix", "")
+                and envs.VLLM_ASCEND_DSV4_WO_A_TRITON
+                and get_ascend_device_type() == AscendDeviceType.A3
+            )
+            # Triton addresses ordinary ND storage; keep only wo_a in ND.
+            # Other linears (including wo_b) retain their existing NZ policy.
+            if self.act_quant_type == torch.int8 and not triton_wo_a:
                 layer.weight.data = maybe_trans_nz(layer.weight.data)
             layer.weight_scale.data = layer.weight_scale.data.flatten()
             layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)

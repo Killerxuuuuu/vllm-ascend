@@ -16,6 +16,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -59,8 +60,10 @@ if TYPE_CHECKING:
 
 if HAS_TRITON:
     from vllm_ascend.ops.triton.rms_norm import triton_q_rms  # noqa: F811
+    from vllm_ascend.ops.triton.transpose_quant_batch_matmul import dynamic_quant_grouped_wo_a
 else:
     triton_q_rms = None  # type: ignore
+    dynamic_quant_grouped_wo_a = None
 
 
 # The SAS and QLI metadata operators use a fixed 1024-element int32 layout.
@@ -110,6 +113,11 @@ def _a3_int8_grouped_wo_a(
             "A3 INT8 wo_a needs one scale per output channel: "
             f"weight_shape={tuple(weight.shape)}, scale_shape={tuple(weight_scale.shape)}"
         )
+
+    if envs.VLLM_ASCEND_DSV4_WO_A_TRITON:
+        if dynamic_quant_grouped_wo_a is None:
+            raise RuntimeError("Triton wo_a was requested but Triton-Ascend is unavailable")
+        return dynamic_quant_grouped_wo_a(activations, weight, weight_scale)
 
     scales = weight_scale.reshape(num_groups, -1)
     outputs = []

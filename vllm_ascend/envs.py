@@ -97,6 +97,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # Experimental A3 DeepSeek V4 wo_a INT8 Triton TQBMM. Valid: 0/1;
+    # default 0 keeps the validated per-group QBMM path on all hardware.
+    # Non-sensitive; affects the hot output-projection path. Requires review
+    # and A3 numerical/graph/performance validation before enabling by default.
+    "VLLM_ASCEND_DSV4_WO_A_TRITON": lambda: bool(int(os.getenv("VLLM_ASCEND_DSV4_WO_A_TRITON", "0"))),
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),

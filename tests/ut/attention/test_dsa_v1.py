@@ -701,6 +701,30 @@ def test_a3_int8_grouped_wo_a_rejects_incompatible_scale():
         )
 
 
+def test_a3_int8_grouped_wo_a_selects_triton_explicitly():
+    activations = torch.ones(2, 2, 64, dtype=torch.bfloat16)
+    weight = torch.ones(2, 64, 32, dtype=torch.int8)
+    scales = torch.ones(2, 32)
+    expected = torch.empty(2, 2, 32, dtype=torch.bfloat16)
+    with (
+        patch("vllm_ascend.attention.dsa_v1.envs.VLLM_ASCEND_DSV4_WO_A_TRITON", True),
+        patch("vllm_ascend.attention.dsa_v1.dynamic_quant_grouped_wo_a", return_value=expected) as fused,
+        patch.object(torch_npu, "npu_quant_matmul") as qbmm,
+    ):
+        assert _a3_int8_grouped_wo_a(activations, weight, scales) is expected
+    fused.assert_called_once_with(activations, weight, scales)
+    qbmm.assert_not_called()
+
+
+def test_a3_int8_grouped_wo_a_does_not_hide_missing_triton():
+    with (
+        patch("vllm_ascend.attention.dsa_v1.envs.VLLM_ASCEND_DSV4_WO_A_TRITON", True),
+        patch("vllm_ascend.attention.dsa_v1.dynamic_quant_grouped_wo_a", None),
+        pytest.raises(RuntimeError, match="unavailable"),
+    ):
+        _a3_int8_grouped_wo_a(torch.ones(1, 1, 64), torch.ones(1, 64, 32, dtype=torch.int8), torch.ones(1, 32))
+
+
 def test_a3_int8_grouped_wo_a_rejects_zero_local_groups():
     with pytest.raises(ValueError, match="at least one group"):
         _a3_int8_grouped_wo_a(

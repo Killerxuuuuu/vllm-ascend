@@ -30,6 +30,9 @@ export CFG_0731="$CFG_DIR/deepseek_v4_flash_0731_a3_w8a8_int8_with_wo_experiment
 
 `dsa_v1.py` 与 DSA-CP 在检测到 A3、`wo_a` 为 `W8A8_DYNAMIC` 且权重为 INT8 时，按 group 执行激活动态 per-token INT8 量化和 2-D `npu_quant_matmul`。`wo_a` 的 per-channel scale 随分组使用；`wo_b` 继续走现有 W8A8 Linear 方法。A5 FP8 与 A3 BF16 路径保持不变。这个分组循环是功能验证路径，**不能当作最终融合算子的性能数据**。
 
+新增可选的 A3 Triton 融合实验版，默认关闭。单算子正确性、真实权重、图模式和性能验证步骤见
+[Triton TQBMM 实验说明](TRITON_TQBMM.md)。先通过单算子测试，再设置开关启动整网。
+
 服务启动前，先确认容器实际导入的是包含此修改的源码；宿主机 `/home/x50063292/vllm-ascend` 的变更不会自动出现在镜像内 `/vllm-workspace/vllm-ascend`：
 
 ```bash
