@@ -44,6 +44,7 @@ def _transpose_quant_batch_matmul_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    TRANSPOSE_WEIGHT_TILE: tl.constexpr = False,
 ):
     # Group nearby M tiles when traversing N, improving weight cache locality.
     pid = tl.program_id(0)
@@ -68,9 +69,19 @@ def _transpose_quant_batch_matmul_kernel(
         # stride_wn=physical K pitch; do not substitute the logical slice K.
         current_k = inner + step * BLOCK_K
         x = x_ptr + rows[:, None] * stride_xt + group * stride_xg + current_k[None, :] * stride_xk
-        w = w_ptr + group * stride_wg + current_k[:, None] * stride_wk + cols[None, :] * stride_wn
-        a = tl.load(x, mask=(rows[:, None] < T) & (current_k[None, :] < K), other=0)
-        b = tl.load(w, mask=(current_k[:, None] < K) & (cols[None, :] < N), other=0)
+        if TRANSPOSE_WEIGHT_TILE:
+            # Experimental only: expose the contiguous physical K dimension
+            # as the load's last axis. Transpose the *tile*, not the full weight.
+            # Absolute offsets, INT8 values, masks and dot ordering are unchanged.
+            w_nk = w_ptr + group * stride_wg + cols[:, None] * stride_wn + current_k[None, :] * stride_wk
+            a = tl.load(x, mask=(rows[:, None] < T) & (current_k[None, :] < K), other=0)
+            b_nk = tl.load(w_nk, mask=(cols[:, None] < N) & (current_k[None, :] < K), other=0)
+            b = tl.trans(b_nk)
+        else:
+            # Keep the device-validated direct-load path as the default.
+            w = w_ptr + group * stride_wg + current_k[:, None] * stride_wk + cols[None, :] * stride_wn
+            a = tl.load(x, mask=(rows[:, None] < T) & (current_k[None, :] < K), other=0)
+            b = tl.load(w, mask=(current_k[:, None] < K) & (cols[None, :] < N), other=0)
         accumulator = tl.dot(a, b, accumulator, out_dtype=tl.int32)
 
     sx = tl.load(sx_ptr + rows * stride_sxt + group * stride_sxg, mask=rows < T, other=0)
@@ -117,6 +128,7 @@ def transpose_quant_batch_matmul(
     output_dtype: torch.dtype = torch.bfloat16,
     block_shape: tuple[int, int, int] | None = None,
     num_stages: int = 1,
+    transpose_weight_tile: bool = False,
 ) -> torch.Tensor:
     """INT8 matmul with per-token-per-group / per-group-per-channel scales.
 
@@ -129,9 +141,13 @@ def transpose_quant_batch_matmul(
     failure. Addresses are now reconstructed per iteration for isolation;
     device validation is still required. No copies, CPU fallback or
     catch-and-retry path are added.
+    ``transpose_weight_tile`` enables an unverified physical [N,K] tile load
+    followed by a tile transpose. The validated direct load remains the default.
     """
     _validate_inputs(x, weight, x_scale, weight_scale, output_dtype)
     _validate_num_stages(num_stages)
+    if type(transpose_weight_tile) is not bool:
+        raise TypeError("transpose_weight_tile must be a bool")
     if x.device.type != "npu":
         raise ValueError("TQBMM is an Ascend NPU kernel; run it on A3")
     tokens, groups, inner = x.shape
@@ -170,12 +186,15 @@ def transpose_quant_batch_matmul(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         GROUP_SIZE_M=DEFAULT_GROUP_SIZE_M,
+        TRANSPOSE_WEIGHT_TILE=transpose_weight_tile,
         num_stages=num_stages,
     )
     return output
 
 
-def dynamic_quant_grouped_wo_a(activations, weight, weight_scale, *, block_shape=None, num_stages=1):
+def dynamic_quant_grouped_wo_a(
+    activations, weight, weight_scale, *, block_shape=None, num_stages=1, transpose_weight_tile=False
+):
     """Keep CANN dynamic quantization, then run one fused TQBMM for all groups."""
     if activations.ndim != 3 or activations.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError("Triton wo_a expects BF16/FP16 activations [T,G,K]")
@@ -199,4 +218,5 @@ def dynamic_quant_grouped_wo_a(activations, weight, weight_scale, *, block_shape
         output_dtype=activations.dtype,
         block_shape=block_shape,
         num_stages=num_stages,
+        transpose_weight_tile=transpose_weight_tile,
     )

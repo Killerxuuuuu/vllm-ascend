@@ -21,7 +21,8 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("inner", [32, 4096])
 @pytest.mark.parametrize("signed", [False, True])
 @pytest.mark.parametrize("transposed", [False, True])
-def test_transposed_weight_multi_k_regression(inner, signed, transposed):
+@pytest.mark.parametrize("transpose_weight_tile", [False, True])
+def test_transposed_weight_multi_k_regression(inner, signed, transposed, transpose_weight_tile):
     """Regression: only strided, multi-K inputs failed on the reported A3."""
     tokens, groups, columns = 16, 1, 32
     torch.manual_seed(0)
@@ -41,12 +42,14 @@ def test_transposed_weight_multi_k_regression(inner, signed, transposed):
         output_dtype=torch.float32,
         block_shape=(16, 32, 32),
         num_stages=1,
+        transpose_weight_tile=transpose_weight_tile,
     )
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("start,end", [(0, 32), (32, 64), (2048, 2080), (4064, 4096), (0, 64), (0, 65), (0, 4096)])
-def test_transposed_weight_fixed_pitch_k_slices(start, end):
+@pytest.mark.parametrize("transpose_weight_tile", [False, True])
+def test_transposed_weight_fixed_pitch_k_slices(start, end, transpose_weight_tile):
     tokens, groups, physical_k, columns = 16, 1, 4096, 32
     torch.manual_seed(0)
     x_cpu = torch.randint(-8, 9, (tokens, groups, physical_k), dtype=torch.int8)
@@ -71,11 +74,13 @@ def test_transposed_weight_fixed_pitch_k_slices(start, end):
         output_dtype=torch.float32,
         block_shape=(16, 32, 32),
         num_stages=1,
+        transpose_weight_tile=transpose_weight_tile,
     )
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
-def test_transposed_multi_k_tail_and_distinct_group_scales():
+@pytest.mark.parametrize("transpose_weight_tile", [False, True])
+def test_transposed_multi_k_tail_and_distinct_group_scales(transpose_weight_tile):
     tokens, groups, inner, columns = 17, 2, 4099, 33
     torch.manual_seed(0)
     x_cpu = torch.randint(-8, 9, (tokens, groups, inner), dtype=torch.int8)
@@ -93,6 +98,7 @@ def test_transposed_multi_k_tail_and_distinct_group_scales():
         output_dtype=torch.float32,
         block_shape=(16, 32, 32),
         num_stages=1,
+        transpose_weight_tile=transpose_weight_tile,
     )
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
@@ -129,12 +135,15 @@ def test_noncontiguous_inputs_and_scales():
 
 
 @pytest.mark.parametrize("value", [-128, -127, 0, 127])
-def test_extreme_int8_values_and_zero_rows(value):
+@pytest.mark.parametrize("transpose_weight_tile", [False, True])
+def test_extreme_int8_values_and_zero_rows(value, transpose_weight_tile):
     x = torch.full((1, 2, 257), value, dtype=torch.int8, device="npu")
     w = torch.full((2, 257, 33), value, dtype=torch.int8, device="npu")
     sx = torch.full((1, 2), 0.125, device="npu")
     sw = torch.full((2, 33), 0.25, device="npu")
-    actual = transpose_quant_batch_matmul(x, w, sx, sw, output_dtype=torch.float32)
+    actual = transpose_quant_batch_matmul(
+        x, w, sx, sw, output_dtype=torch.float32, transpose_weight_tile=transpose_weight_tile
+    )
     expected = torch.full((1, 2, 33), value * value * 257 * 0.125 * 0.25)
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 

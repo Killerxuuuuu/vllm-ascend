@@ -4,6 +4,90 @@
 当前完成源码开发、本地静态检查和 NumPy 索引/整数计算审计；**A3 编译、数值、ACLGraph 和性能必须在服务器验证**。
 默认仍使用已验证的 CANN 分组拼接路径，不改变现有服务结果。
 
+## 性能优化轮次：保留数值基线，离线选择候选
+
+服务器已反馈：逐轮从基址计算地址的版本，布局、固定 pitch、真实权重及图模式检查通过；
+T=1/16/64/512 在 `16 32 32`、`num_stages=1` 下，两种数值比较均为 max_abs=0、nrmse=0。
+相应 eager Triton 耗时约 0.119/0.117/0.158/0.985 ms，拼接参考约 0.070/0.070/0.069/0.081 ms。
+这些是用户服务器的基线，不是本轮新增候选的测量结果。
+
+### 不改变已经通过的默认计算路径
+
+- 仍使用 `tl.dot(INT8, INT8, INT32)`，不改输入类型、累加顺序或反量化顺序。
+- 保留每个 K tile 从基址计算地址的逻辑，以及原来的 mask/尾块处理。
+- 默认 N/K=32、num_stages=1；未经设备验证不自动提升生产分块或打开流水线。
+- 新增 `--transpose-weight-tile` 显式候选：按物理 `[N,K]` 加载小块，`tl.trans` 后交给
+  相同的 `tl.dot`。它不复制整个权重、不改 scale，且默认关闭。
+- 不引入运行时 autotune、全局权重缓存或新的环境变量。离线推荐不会自动改部署配置。
+
+权重 stride `[4194304,1,4096]` 表示 **K 连续、N 跨步**，不是 K 跨步。
+源码本来就有 `tl.dot`；仅看到 AIV 侧 load/cast/deinterleave，不能推断 Cube 没有运行。
+T 增长 512 倍而耗时增长约 8 倍，也不应描述为相对 T 的超线性增长。
+
+### 一条命令跑带精确数值门禁的调优
+
+使用运行 vLLM 的 Python，不使用 ModelSlim/AISBench 的虚拟环境：
+
+```bash
+cd /home/w00601343/vllm-ascend
+export QUANT_MODEL=/home/w00601343/outputs/dsv4-0731-w8a8-int8-with-wo-20261019-081956
+
+# 只显示候选，不分配 NPU、不创建结果目录。
+python -m tools.dsv4_a3_wo.tune_tqbmm \
+  --quant-model "$QUANT_MODEL" --transpose-weight-tile --dry-run
+
+# 先增大 M 复用权重，再测试小块的流水线与局部 NK 加载候选。
+python -m tools.dsv4_a3_wo.tune_tqbmm \
+  --quant-model "$QUANT_MODEL" \
+  --transpose-weight-tile \
+  --timing-mode both \
+  --warmup 10 --iterations 100 --repeats 3
+```
+
+加 `--extended` 才进一步尝试有限的 N/K=64 组合。不会回到历史失败的 N/K=128。
+候选按包含 32-byte padding、转换临时区及 epilogue 的保守估算筛选，默认筛选额度为
+192 KiB；这不是查询到的设备 UB 容量，也不能保证编译器最终分配一定成功。
+编译器实际内存规划是最终依据；编译失败、超时或数值失败的候选保留完整日志并拒绝排名，
+绝不会通过更大误差阈值或回退到 CANN 来冒充 Triton 性能。
+
+每个候选在独立子进程中运行，先跑八项布局和七项固定 pitch 检查，再在四种 T 下
+检查真实权重、动态量化与修改输入后的图重放，使用 `--strict` 要求精确相等。
+所有 T 全部通过的候选才进入推荐列表；某个 T 失败会使该候选整体无效。
+原有默认 benchmark 容差没有放宽，离线调优的门禁更严格。
+已知基线若失败，整个调优停止，先检查环境/日志，不继续无意义地扫候选。
+
+输出位于终端打印的 `tqbmm-tuning/<时间>/`：
+
+- `results.json`：配置、逐 T 数值、原始计时样本、拒绝原因和各 T/计时模式的最优实测候选。
+- `timings.csv`：T=1/16/64/512 的两条路径与两种计时模式，可直接做表对比。
+- 每个候选的 `.log`：完整导入、编译与运行日志。失败候选的部分计时会标为 rejected。
+
+`eager` 保持历史事件计时口径，包含 Python 逐次提交可能产生的空隙。
+`graph` 在图内批量执行，再用事件测重放，报告每次调用的平均设备流耗时，
+不是单请求延迟；capture/编译不计入时间。两条路径使用相同计时协议，不能将
+graph 的 Triton 数字与 eager 的 CANN 数字混着比较。报告取重复区间的中位数并保留原样本。
+图模式不支持时会明确失败，不会静默退回 eager。
+
+### 导出完整编译产物辅助检查 Cube
+
+以下只检查一组配置，不同时测性能。使用独立临时缓存，避免命中已有缓存而不产生 dump：
+
+```bash
+TQBMM_IR_DIR="$PWD/tqbmm-ir-$(date +%Y%m%d-%H%M%S)"
+TQBMM_CACHE_DIR=$(mktemp -d /tmp/tqbmm-cache.XXXXXX)
+mkdir -p "$TQBMM_IR_DIR"
+
+TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR="$TQBMM_IR_DIR" \
+TRITON_CACHE_DIR="$TQBMM_CACHE_DIR" \
+python -m tools.dsv4_a3_wo.benchmark_tqbmm \
+  --quant-model "$QUANT_MODEL" --tokens 512 \
+  --block-shape 64 32 32 --num-stages 1 --strict --check-only
+```
+
+检查 AIC/Cube 分支及最终矩乘指令（如 MMAD），并结合设备 profiling 判断执行与耗时。
+只导出早期 TTIR/Linalg、只看到 AIV 函数或检索不到某个关键字，都不能单独证明未使用 Cube。
+不要在调优计时的同一次运行启用 dump/profiler；IR 和性能采集应分开。
+
 ### 已收到的 A3 验证结果与候选修改
 
 原默认 N/K 分块为 128，真实转置权重的编译 IR 出现 `128x128x32xi8`

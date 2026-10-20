@@ -58,6 +58,10 @@ class Language:
         return np.zeros(shape, dtype=dtype).view(Array)
 
     @staticmethod
+    def trans(value):
+        return value.T.view(Array)
+
+    @staticmethod
     def load(pointer, mask, other):
         offsets, valid = np.broadcast_arrays(pointer.offset, mask)
         result = np.full(offsets.shape, other, dtype=pointer.storage.dtype)
@@ -94,8 +98,11 @@ def load_function(name, namespace):
     "shape", [(1, 1, 1, 1), (17, 2, 65, 33), (65, 3, 129, 131), (513, 2, 33, 129), (16, 1, 4096, 32)]
 )
 @pytest.mark.parametrize("strided", [False, True])
-@pytest.mark.parametrize("block_shape", [(16, 32, 32), (32, 64, 64)])
-def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided, block_shape):
+@pytest.mark.parametrize(
+    "block_shape", [(16, 32, 32), (32, 32, 32), (64, 32, 32), (16, 32, 64), (32, 32, 64), (16, 64, 32), (32, 64, 64)]
+)
+@pytest.mark.parametrize("transpose_weight_tile", [False, True])
+def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided, block_shape, transpose_weight_tile):
     tokens, groups, inner, columns = shape
     rng = np.random.default_rng(0)
     if strided:
@@ -135,6 +142,7 @@ def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided, block_shap
                 block_n,
                 block_k,
                 4,
+                transpose_weight_tile,
             )
     integer_golden = np.einsum("tgk,gkn->tgn", x.astype(np.int64), weight.astype(np.int64))
     expected = (integer_golden.astype(np.float32) * sw[None]) * sx[:, :, None]
@@ -142,7 +150,8 @@ def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided, block_shap
 
 
 @pytest.mark.parametrize("start,end", [(0, 32), (32, 64), (2048, 2080), (4064, 4096), (0, 64), (0, 65), (0, 4096)])
-def test_fixed_physical_weight_pitch_with_logical_k_slices(start, end):
+@pytest.mark.parametrize("transpose_weight_tile", [False, True])
+def test_fixed_physical_weight_pitch_with_logical_k_slices(start, end, transpose_weight_tile):
     """Physical column stride stays 4096 even when logical K is 32 or 65."""
     tokens, groups, physical_k, columns = 17, 2, 4096, 33
     rng = np.random.default_rng(1)
@@ -174,6 +183,7 @@ def test_fixed_physical_weight_pitch_with_logical_k_slices(start, end):
                 block_n,
                 block_k,
                 4,
+                transpose_weight_tile,
             )
     golden = np.einsum("tgk,gkn->tgn", x.astype(np.int64), weight.astype(np.int64))
     expected = (golden.astype(np.float32) * sw[None]) * sx[:, :, None]
@@ -191,7 +201,8 @@ def test_num_stages_validation_without_runtime_imports(num_stages):
 
 
 @pytest.mark.parametrize("num_stages", [None, 1, 2])
-def test_launch_uses_small_tiles_and_forwards_num_stages(num_stages):
+@pytest.mark.parametrize("transpose_weight_tile", [None, False, True])
+def test_launch_uses_small_tiles_and_forwards_num_stages(num_stages, transpose_weight_tile):
     """Check host launch wiring only, not device/compiler correctness."""
     launches = []
 
@@ -221,12 +232,15 @@ def test_launch_uses_small_tiles_and_forwards_num_stages(num_stages):
     }
     operator = load_function("transpose_quant_batch_matmul", namespace)
     kwargs = {} if num_stages is None else {"num_stages": num_stages}
+    if transpose_weight_tile is not None:
+        kwargs["transpose_weight_tile"] = transpose_weight_tile
     assert operator(x, weight, sx, sw, **kwargs) is output
     assert len(launches) == 1
     grid, launch = launches[0]
     assert grid == (1, 1)
     assert (launch["BLOCK_M"], launch["BLOCK_N"], launch["BLOCK_K"]) == (16, 32, 32)
     assert launch["num_stages"] == (1 if num_stages is None else num_stages)
+    assert launch["TRANSPOSE_WEIGHT_TILE"] == (False if transpose_weight_tile is None else transpose_weight_tile)
 
 
 @pytest.mark.parametrize(

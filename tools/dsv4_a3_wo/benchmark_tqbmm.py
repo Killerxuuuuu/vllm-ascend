@@ -7,6 +7,7 @@ Run from the repository root with ``python -m tools.dsv4_a3_wo.benchmark_tqbmm``
 import argparse
 import json
 from pathlib import Path
+from statistics import median
 
 import torch
 import torch_npu
@@ -21,6 +22,7 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 LAYOUT_CHECK_TOKENS = 16
 LAYOUT_CHECK_COLUMNS = 32
 LAYOUT_CHECK_INNER_SIZES = (32, 4096)
+DEFAULT_GRAPH_BATCH_SIZE = 16
 
 
 @torch.inference_mode()
@@ -33,6 +35,7 @@ def check_weight_layouts(args):
     sx = torch.ones(LAYOUT_CHECK_TOKENS, 1, device=args.device, dtype=torch.float32)
     sw = torch.ones(1, LAYOUT_CHECK_COLUMNS, device=args.device, dtype=torch.float32)
     results = []
+    block_shape = tuple(args.block_shape) if args.block_shape else (16, 32, 32)
     for inner in LAYOUT_CHECK_INNER_SIZES:
         for signed in (False, True):
             low = -8 if signed else 0
@@ -50,8 +53,9 @@ def check_weight_layouts(args):
                     sx,
                     sw,
                     output_dtype=torch.float32,
-                    block_shape=(LAYOUT_CHECK_TOKENS, LAYOUT_CHECK_COLUMNS, LAYOUT_CHECK_INNER_SIZES[0]),
+                    block_shape=block_shape,
                     num_stages=args.num_stages,
+                    transpose_weight_tile=args.transpose_weight_tile,
                 ).cpu()
                 diff = (actual - expected).abs()
                 # Diagnostic only: both tensors are now on CPU, outside timing.
@@ -60,6 +64,8 @@ def check_weight_layouts(args):
                     "signed": signed,
                     "transposed": transposed,
                     "num_stages": args.num_stages,
+                    "block_shape": list(block_shape),
+                    "transpose_weight_tile": args.transpose_weight_tile,
                     "weight_stride": list(weight.stride()),
                     "mismatch": int((diff != 0).sum()),
                     "max_abs": float(diff.max()),
@@ -102,6 +108,7 @@ def check_k_loop(args):
         (0, inner),
     )
     results = []
+    block_shape = tuple(args.block_shape) if args.block_shape else (16, 32, 32)
     for start, end in spans:
         x_view = x[:, :, start:end]
         w_view = weight[:, start:end, :]
@@ -119,8 +126,9 @@ def check_k_loop(args):
             sx,
             sw,
             output_dtype=torch.float32,
-            block_shape=(LAYOUT_CHECK_TOKENS, LAYOUT_CHECK_COLUMNS, block_k),
+            block_shape=block_shape,
             num_stages=args.num_stages,
+            transpose_weight_tile=args.transpose_weight_tile,
         ).cpu()
         diff = (actual - expected).abs()
         case = {
@@ -129,6 +137,8 @@ def check_k_loop(args):
             "weight_stride": list(w_view.stride()),
             "weight_storage_offset": w_view.storage_offset(),
             "num_stages": args.num_stages,
+            "block_shape": list(block_shape),
+            "transpose_weight_tile": args.transpose_weight_tile,
             "mismatch": int((diff != 0).sum()),
             "max_abs": float(diff.max()),
         }
@@ -172,18 +182,65 @@ def dynamic_qbmm_reference(x, weight, sw):
     return torch.stack(outputs, dim=1)
 
 
-def elapsed_ms(function, warmup, iterations):
+def elapsed_ms(function, warmup, iterations, *, timing_mode="eager", graph_batch_size=DEFAULT_GRAPH_BATCH_SIZE):
+    """Eager events include submission gaps; graph batches reduce those gaps.
+
+    Graph timing is average device-stream throughput per call, not request
+    latency. Setup, compilation and capture are outside the event interval.
+    """
     for _ in range(warmup):
         function()
     torch.npu.synchronize()
+    graph = None
+    if timing_mode == "graph":
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            for _ in range(graph_batch_size):
+                output = function()
+        graph.replay()
+        torch.npu.synchronize()
+        calls_per_replay = graph_batch_size
+        repetitions = (iterations + graph_batch_size - 1) // graph_batch_size
+    else:
+        calls_per_replay = 1
+        repetitions = iterations
     start = torch.npu.Event(enable_timing=True)
     end = torch.npu.Event(enable_timing=True)
     start.record()
-    for _ in range(iterations):
-        function()
+    for _ in range(repetitions):
+        if graph is None:
+            function()
+        else:
+            graph.replay()
     end.record()
     end.synchronize()
-    return start.elapsed_time(end) / iterations
+    # Keep the captured output alive through replay without retaining every
+    # intermediate output (which would distort the graph allocation lifetime).
+    if graph is not None:
+        del output
+    return start.elapsed_time(end) / (repetitions * calls_per_replay)
+
+
+def collect_timings(functions, args, timing_mode):
+    samples = {
+        name: [
+            elapsed_ms(
+                function,
+                args.warmup,
+                args.iterations,
+                timing_mode=timing_mode,
+                graph_batch_size=args.graph_batch_size,
+            )
+            for _ in range(args.repeats)
+        ]
+        for name, function in functions.items()
+    }
+    durations = {name: median(values) for name, values in samples.items()}
+    durations["prequantized_speedup"] = durations["qbmm_composition_prequantized"] / durations["triton_prequantized"]
+    durations["including_quant_speedup"] = (
+        durations["qbmm_composition_including_quant"] / durations["triton_including_quant"]
+    )
+    return durations, samples
 
 
 def load_wo_a(args):
@@ -240,18 +297,32 @@ def run(args):
     block_shape = tuple(args.block_shape) if args.block_shape else None
 
     def fused():
-        return transpose_quant_batch_matmul(x, weight, sx, sw, block_shape=block_shape, num_stages=args.num_stages)
+        return transpose_quant_batch_matmul(
+            x,
+            weight,
+            sx,
+            sw,
+            block_shape=block_shape,
+            num_stages=args.num_stages,
+            transpose_weight_tile=args.transpose_weight_tile,
+        )
 
     def reference():
         return qbmm_reference(x, weight, sx, sw, torch.bfloat16)
 
     actual, expected = fused(), reference()
-    torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.02)
+    rtol, atol = (0, 0) if args.strict else (0.01, 0.02)
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, equal_nan=False)
     dynamic_actual = dynamic_quant_grouped_wo_a(
-        activations, weight, sw, block_shape=block_shape, num_stages=args.num_stages
+        activations,
+        weight,
+        sw,
+        block_shape=block_shape,
+        num_stages=args.num_stages,
+        transpose_weight_tile=args.transpose_weight_tile,
     )
     dynamic_expected = dynamic_qbmm_reference(activations, weight, sw)
-    torch.testing.assert_close(dynamic_actual, dynamic_expected, rtol=0.01, atol=0.02)
+    torch.testing.assert_close(dynamic_actual, dynamic_expected, rtol=rtol, atol=atol, equal_nan=False)
     report = {
         "shape_T_G_K_N": [args.tokens, groups, inner, columns],
         "weight_stride": list(weight.stride()),
@@ -260,6 +331,9 @@ def run(args):
         "torch_npu": torch_npu.__version__,
         "num_stages": args.num_stages,
         "requested_block_shape": block_shape,
+        "transpose_weight_tile": args.transpose_weight_tile,
+        "strict_correctness": args.strict,
+        "timing_mode": args.timing_mode,
         "same_int8_inputs": error_metrics(actual, expected),
         "including_dynamic_quant": error_metrics(dynamic_actual, dynamic_expected),
         "note": "Compares with the existing INT8 composition, not original BF16/FP8 model accuracy.",
@@ -270,33 +344,45 @@ def run(args):
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             captured = dynamic_quant_grouped_wo_a(
-                activations, weight, sw, block_shape=block_shape, num_stages=args.num_stages
+                activations,
+                weight,
+                sw,
+                block_shape=block_shape,
+                num_stages=args.num_stages,
+                transpose_weight_tile=args.transpose_weight_tile,
             )
         # Replay with changed inputs, not just a repeated captured answer.
         activations.mul_(0.5)
         graph.replay()
         torch.npu.synchronize()
-        torch.testing.assert_close(captured, dynamic_qbmm_reference(activations, weight, sw), rtol=0.01, atol=0.02)
+        torch.testing.assert_close(
+            captured, dynamic_qbmm_reference(activations, weight, sw), rtol=rtol, atol=atol, equal_nan=False
+        )
+        # Restore the power-of-two-scaled BF16 inputs before timing so eager
+        # and graph measurements use the same data as the initial checks.
+        activations.mul_(2.0)
         report["graph_replay_with_changed_input"] = "passed"
     if not args.check_only:
-        fused_ms = elapsed_ms(fused, args.warmup, args.iterations)
-        reference_ms = elapsed_ms(reference, args.warmup, args.iterations)
-        dynamic_ms = elapsed_ms(
-            lambda: dynamic_quant_grouped_wo_a(
-                activations, weight, sw, block_shape=block_shape, num_stages=args.num_stages
+        functions = {
+            "triton_prequantized": fused,
+            "qbmm_composition_prequantized": reference,
+            "triton_including_quant": lambda: dynamic_quant_grouped_wo_a(
+                activations,
+                weight,
+                sw,
+                block_shape=block_shape,
+                num_stages=args.num_stages,
+                transpose_weight_tile=args.transpose_weight_tile,
             ),
-            args.warmup,
-            args.iterations,
-        )
-        baseline_ms = elapsed_ms(lambda: dynamic_qbmm_reference(activations, weight, sw), args.warmup, args.iterations)
-        report["timing_ms"] = {
-            "triton_prequantized": fused_ms,
-            "qbmm_composition_prequantized": reference_ms,
-            "prequantized_speedup": reference_ms / fused_ms,
-            "triton_including_quant": dynamic_ms,
-            "qbmm_composition_including_quant": baseline_ms,
-            "including_quant_speedup": baseline_ms / dynamic_ms,
+            "qbmm_composition_including_quant": lambda: dynamic_qbmm_reference(activations, weight, sw),
         }
+        report["timing_samples_ms"] = {}
+        modes = ("eager", "graph") if args.timing_mode == "both" else (args.timing_mode,)
+        for mode in modes:
+            durations, samples = collect_timings(functions, args, mode)
+            report["timing_ms" if mode == "eager" else "graph_timing_ms"] = durations
+            report["timing_samples_ms"][mode] = samples
+        report["graph_batch_size"] = args.graph_batch_size
     return report
 
 
@@ -312,6 +398,7 @@ def parse_args():
     parser.add_argument("--tp-size", type=int, default=8)
     parser.add_argument("--tp-rank", type=int, default=0)
     parser.add_argument("--block-shape", type=int, nargs=3, metavar=("M", "N", "K"))
+    parser.add_argument("--transpose-weight-tile", action="store_true", help="Experimental physical [N,K] tile load")
     parser.add_argument(
         "--num-stages",
         type=int,
@@ -325,10 +412,27 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=30)
+    parser.add_argument("--repeats", type=int, default=1, help="Report median across independent timing intervals")
+    parser.add_argument("--timing-mode", choices=("eager", "graph", "both"), default="eager")
+    parser.add_argument("--graph-batch-size", type=int, default=DEFAULT_GRAPH_BATCH_SIZE)
+    parser.add_argument("--strict", action="store_true", help="Require exactly equal outputs before timing")
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--graph", action="store_true")
     args = parser.parse_args()
-    if min(args.tokens, args.groups, args.inner, args.columns, args.iterations, args.tp_size) <= 0 or args.warmup < 0:
+    if (
+        min(
+            args.tokens,
+            args.groups,
+            args.inner,
+            args.columns,
+            args.iterations,
+            args.tp_size,
+            args.repeats,
+            args.graph_batch_size,
+        )
+        <= 0
+        or args.warmup < 0
+    ):
         parser.error("dimensions, iterations and tp-size must be positive; warmup must be >= 0")
     return args
 
