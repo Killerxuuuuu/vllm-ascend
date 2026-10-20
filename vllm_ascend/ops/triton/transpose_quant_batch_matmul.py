@@ -12,8 +12,10 @@ from vllm.triton_utils import tl, triton
 
 # Worst case: K products of (-128) * (-128), accumulated in signed INT32.
 MAX_INT8_ACCUMULATION_K = (2**31 - 1) // (128 * 128)
-DEFAULT_BLOCK_N = 128
-DEFAULT_BLOCK_K = 128
+# Transposed INT8 loads can acquire 32-byte padding in the A3 vector lowering.
+# Keep tiles small until larger configurations pass device correctness tests.
+DEFAULT_BLOCK_N = 32
+DEFAULT_BLOCK_K = 32
 DEFAULT_GROUP_SIZE_M = 4
 
 
@@ -98,6 +100,11 @@ def _validate_inputs(x, weight, x_scale, weight_scale, output_dtype):
         raise ValueError("All TQBMM tensors must be on the same device")
 
 
+def _validate_num_stages(num_stages):
+    if type(num_stages) is not int or num_stages not in (1, 2):
+        raise ValueError("num_stages must be 1 (disable auto multi-buffering) or 2 (automatic mode)")
+
+
 def transpose_quant_batch_matmul(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -106,16 +113,20 @@ def transpose_quant_batch_matmul(
     *,
     output_dtype: torch.dtype = torch.bfloat16,
     block_shape: tuple[int, int, int] | None = None,
+    num_stages: int = 1,
 ) -> torch.Tensor:
     """INT8 matmul with per-token-per-group / per-group-per-channel scales.
 
     Supports strided ND inputs (including [G,N,K].transpose(1,2) weights),
     zero tokens, and masked M/N/K tails. Bias, offsets and MX scales are not
     supported. ``block_shape`` overrides the conservative, untuned defaults.
-    No CPU fallback or catch-and-retry path is provided: compilation errors
-    must remain visible during validation.
+    ``num_stages=1`` disables Ascend automatic multi-buffering for correctness
+    isolation; ``2`` restores automatic mode, not an exact two-buffer count.
+    This is a candidate workaround for strided multi-K failures, not a verified
+    compiler fix. No copies, CPU fallback or catch-and-retry path are added.
     """
     _validate_inputs(x, weight, x_scale, weight_scale, output_dtype)
+    _validate_num_stages(num_stages)
     if x.device.type != "npu":
         raise ValueError("TQBMM is an Ascend NPU kernel; run it on A3")
     tokens, groups, inner = x.shape
@@ -154,17 +165,19 @@ def transpose_quant_batch_matmul(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         GROUP_SIZE_M=DEFAULT_GROUP_SIZE_M,
+        num_stages=num_stages,
     )
     return output
 
 
-def dynamic_quant_grouped_wo_a(activations, weight, weight_scale, *, block_shape=None):
+def dynamic_quant_grouped_wo_a(activations, weight, weight_scale, *, block_shape=None, num_stages=1):
     """Keep CANN dynamic quantization, then run one fused TQBMM for all groups."""
     if activations.ndim != 3 or activations.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError("Triton wo_a expects BF16/FP16 activations [T,G,K]")
     tokens, groups, inner = activations.shape
     if groups <= 0 or inner <= 0:
         raise ValueError("Triton wo_a requires positive G and K")
+    _validate_num_stages(num_stages)
     # Flattening T,G quantizes each row over K, exactly as the per-group path.
     if tokens:
         quantized, scales = torch_npu.npu_dynamic_quant(
@@ -180,4 +193,5 @@ def dynamic_quant_grouped_wo_a(activations, weight, weight_scale, *, block_shape
         weight_scale.reshape(groups, -1).float(),
         output_dtype=activations.dtype,
         block_shape=block_shape,
+        num_stages=num_stages,
     )

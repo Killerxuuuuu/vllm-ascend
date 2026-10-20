@@ -82,16 +82,20 @@ def load_function(name, namespace):
     tree = ast.parse(KERNEL_PATH.read_text(encoding="utf-8"))
     function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
     function.decorator_list = []
-    for argument in function.args.args:
+    function.returns = None
+    for argument in (*function.args.args, *function.args.kwonlyargs):
         argument.annotation = None
     module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
     exec(compile(module, str(KERNEL_PATH), "exec"), namespace)
     return namespace[function.name]
 
 
-@pytest.mark.parametrize("shape", [(1, 1, 1, 1), (17, 2, 65, 33), (65, 3, 129, 131), (513, 2, 33, 129)])
+@pytest.mark.parametrize(
+    "shape", [(1, 1, 1, 1), (17, 2, 65, 33), (65, 3, 129, 131), (513, 2, 33, 129), (16, 1, 4096, 32)]
+)
 @pytest.mark.parametrize("strided", [False, True])
-def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided):
+@pytest.mark.parametrize("block_shape", [(16, 32, 32), (32, 64, 64)])
+def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided, block_shape):
     tokens, groups, inner, columns = shape
     rng = np.random.default_rng(0)
     if strided:
@@ -111,7 +115,7 @@ def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided):
         x, weight, sx, sw = x_storage, w_storage, sx_storage, sw_storage
     actual = np.full((tokens, groups, columns), np.nan, dtype=np.float32)
     strides = tuple(step // value.itemsize for value in (x, weight, sx, sw) for step in value.strides)
-    block_m, block_n, block_k = 32, 64, 64
+    block_m, block_n, block_k = block_shape
     num_tiles = Language.cdiv(tokens, block_m) * Language.cdiv(columns, block_n)
     for group in range(groups):
         for pid in range(num_tiles):
@@ -135,6 +139,55 @@ def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided):
     integer_golden = np.einsum("tgk,gkn->tgn", x.astype(np.int64), weight.astype(np.int64))
     expected = (integer_golden.astype(np.float32) * sw[None]) * sx[:, :, None]
     np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("num_stages", [1, 2, 0, -1, 3, "1", None, True, 1.0])
+def test_num_stages_validation_without_runtime_imports(num_stages):
+    validate = load_function("_validate_num_stages", {})
+    if type(num_stages) is int and num_stages in (1, 2):
+        validate(num_stages)
+    else:
+        with pytest.raises(ValueError, match="num_stages"):
+            validate(num_stages)
+
+
+@pytest.mark.parametrize("num_stages", [None, 1, 2])
+def test_launch_uses_small_tiles_and_forwards_num_stages(num_stages):
+    """Check host launch wiring only, not device/compiler correctness."""
+    launches = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append((grid, kwargs))
+
+            return launch
+
+    device = SimpleNamespace(type="npu")
+    x = SimpleNamespace(shape=(16, 1, 4096), device=device, stride=lambda: (4096, 4096, 1))
+    weight = SimpleNamespace(stride=lambda: (131072, 1, 4096), shape=(1, 4096, 32))
+    sx = SimpleNamespace(stride=lambda: (1, 1))
+    sw = SimpleNamespace(stride=lambda: (32, 1))
+    output = object()
+    namespace = {
+        "torch": SimpleNamespace(bfloat16="bf16", empty=lambda *args, **kwargs: output),
+        "torch_npu": SimpleNamespace(get_npu_format=lambda tensor: 2),
+        "triton": SimpleNamespace(cdiv=Language.cdiv),
+        "_validate_inputs": lambda *args: None,
+        "_validate_num_stages": load_function("_validate_num_stages", {}),
+        "_transpose_quant_batch_matmul_kernel": Kernel(),
+        "DEFAULT_BLOCK_N": 32,
+        "DEFAULT_BLOCK_K": 32,
+        "DEFAULT_GROUP_SIZE_M": 4,
+    }
+    operator = load_function("transpose_quant_batch_matmul", namespace)
+    kwargs = {} if num_stages is None else {"num_stages": num_stages}
+    assert operator(x, weight, sx, sw, **kwargs) is output
+    assert len(launches) == 1
+    grid, launch = launches[0]
+    assert grid == (1, 1)
+    assert (launch["BLOCK_M"], launch["BLOCK_N"], launch["BLOCK_K"]) == (16, 32, 32)
+    assert launch["num_stages"] == (1 if num_stages is None else num_stages)
 
 
 @pytest.mark.parametrize(

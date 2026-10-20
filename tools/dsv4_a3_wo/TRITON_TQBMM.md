@@ -4,6 +4,35 @@
 当前完成源码开发、本地静态检查和 NumPy 索引/整数计算审计；**A3 编译、数值、ACLGraph 和性能必须在服务器验证**。
 默认仍使用已验证的 CANN 分组拼接路径，不改变现有服务结果。
 
+### 已收到的 A3 验证结果与候选修改
+
+原默认 N/K 分块为 128，真实转置权重的编译 IR 出现 `128x128x32xi8`
+UB 临时缓冲，内存规划失败。改用 `16 32 32` 后可以执行，但小整数、单位 scale
+对照中仅转置视图的 K=4096 多轮累加失败；K=32 和连续权重均通过。
+这定位了触发组合，尚不能证明编译器缺陷或流水线问题是最终根因。
+
+当前候选修改默认采用 N/K=32，并明确设置 `num_stages=1` 关闭后端自动多缓冲。
+没有修改量化权重、放宽阈值、复制转置权重或替换 INT8 运算。
+`--num-stages 2` 可恢复自动模式做受控对照；该数值不是固定两级缓冲的承诺。
+如果关闭多缓冲后仍失败，下一步应隔离 K 循环的地址递推、转置加载及生成的同步，
+不能把这个候选修改视为已经修复。先运行无需权重的八项检查：
+
+```bash
+python -m tools.dsv4_a3_wo.benchmark_tqbmm --layout-check --num-stages 1
+```
+
+八项必须全部 `mismatch=0` 才继续真实权重；仅该检查通过不代表完整 INT8 范围或反量化已通过：
+
+```bash
+python -m tools.dsv4_a3_wo.benchmark_tqbmm \
+  --quant-model "$QUANT_MODEL" --layer 0 --tp-size 8 --tp-rank 0 \
+  --tokens 16 --block-shape 16 32 32 --num-stages 1 --check-only --graph
+```
+
+可选地把第一条命令的 `--num-stages 1` 改为 `2` 复现旧自动模式，
+只在其他任务停止的独立设备上运行；编译错误或错误数值均应保留。
+本地 CPU 测试不能验证 Ascend 的缓冲同步；恢复 profiling/整网验证前必须拿到 A3 结果。
+
 ## 计算范围
 
 - 输入 INT8 `X[T,G,K]`、INT8 `W[G,K,N]`，支持 ND 的非连续 stride，包括转置权重视图。
@@ -12,7 +41,7 @@
 - 单次内核启动覆盖全部 group，加载和存储直接使用最终布局，不生成完整输入/输出转置张量。
 - 动态量化在外部：将 BF16/FP16 `[T,G,K]` 展成 `[T*G,K]`，调用一次 `npu_dynamic_quant`。
 - 不支持 NZ、bias、非零 offset、MX scale；拒绝可能发生最坏情况 INT32 溢出的 K。
-- M/N/K 尾块使用 mask；允许 T=0。首版为静态分块和 M 分组遍历，尚未实现 A5 的持久调度、尾轮拆分或手工多级缓冲。
+- M/N/K 尾块使用 mask；允许 T=0。当前默认 N/K=32、禁用自动多缓冲；尚未实现 A5 的持久调度、尾轮拆分或手工多级缓冲。
 
 结构参考已读取的 CANN ops-nn `fd22493ef` 和 ops-tensor `cbdc8cdc47d690bd0371dc7a3d806ea83ed1168b`。
 这不是 A5 AscendC/Blaze 内核的逐行翻译，也不保证 Triton 编译器生成相同流水线。

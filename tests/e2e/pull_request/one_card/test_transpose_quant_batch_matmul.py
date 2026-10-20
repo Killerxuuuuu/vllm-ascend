@@ -18,6 +18,33 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("inner", [32, 4096])
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_transposed_weight_multi_k_regression(inner, signed, transposed):
+    """Regression: only strided, multi-K inputs failed on the reported A3."""
+    tokens, groups, columns = 16, 1, 32
+    torch.manual_seed(0)
+    low = -8 if signed else 0
+    x_cpu = torch.randint(low, 9, (tokens, groups, inner), dtype=torch.int8)
+    w_cpu = torch.randint(low, 9, (groups, columns, inner), dtype=torch.int8)
+    expected = torch.bmm(x_cpu.double().transpose(0, 1), w_cpu.double().transpose(1, 2))
+    expected = expected.transpose(0, 1).float()
+    weight = w_cpu.npu().transpose(1, 2)
+    if not transposed:
+        weight = weight.contiguous()
+    actual = transpose_quant_batch_matmul(
+        x_cpu.npu(),
+        weight,
+        torch.ones(tokens, groups, device="npu", dtype=torch.float32),
+        torch.ones(groups, columns, device="npu", dtype=torch.float32),
+        output_dtype=torch.float32,
+        block_shape=(16, 32, 32),
+        num_stages=1,
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("shape", [(1, 1, 64, 32), (17, 2, 65, 33), (65, 3, 129, 131), (513, 2, 64, 129)])
 @pytest.mark.parametrize("transposed_weight", [False, True])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float32])

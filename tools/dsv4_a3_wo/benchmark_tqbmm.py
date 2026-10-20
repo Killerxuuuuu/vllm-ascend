@@ -18,6 +18,57 @@ from vllm_ascend.ops.triton.transpose_quant_batch_matmul import (
 )
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
+LAYOUT_CHECK_TOKENS = 16
+LAYOUT_CHECK_COLUMNS = 32
+LAYOUT_CHECK_INNER_SIZES = (32, 4096)
+
+
+@torch.inference_mode()
+def check_weight_layouts(args):
+    """Isolate signed loads, strided weights and single/multi-K accumulation."""
+    if not torch.npu.is_available() or get_ascend_device_type() != AscendDeviceType.A3:
+        raise RuntimeError("This probe requires an Ascend A3 NPU and Triton-Ascend")
+    torch.npu.set_device(args.device)
+    torch.manual_seed(args.seed)
+    sx = torch.ones(LAYOUT_CHECK_TOKENS, 1, device=args.device, dtype=torch.float32)
+    sw = torch.ones(1, LAYOUT_CHECK_COLUMNS, device=args.device, dtype=torch.float32)
+    results = []
+    for inner in LAYOUT_CHECK_INNER_SIZES:
+        for signed in (False, True):
+            low = -8 if signed else 0
+            x_cpu = torch.randint(low, 9, (LAYOUT_CHECK_TOKENS, 1, inner), dtype=torch.int8)
+            w_cpu = torch.randint(low, 9, (1, LAYOUT_CHECK_COLUMNS, inner), dtype=torch.int8)
+            expected = torch.bmm(x_cpu.double().transpose(0, 1), w_cpu.double().transpose(1, 2))
+            expected = expected.transpose(0, 1).float()
+            x = x_cpu.to(args.device)
+            transposed_weight = w_cpu.to(args.device).transpose(1, 2)
+            for transposed in (False, True):
+                weight = transposed_weight if transposed else transposed_weight.contiguous()
+                actual = transpose_quant_batch_matmul(
+                    x,
+                    weight,
+                    sx,
+                    sw,
+                    output_dtype=torch.float32,
+                    block_shape=(LAYOUT_CHECK_TOKENS, LAYOUT_CHECK_COLUMNS, LAYOUT_CHECK_INNER_SIZES[0]),
+                    num_stages=args.num_stages,
+                ).cpu()
+                diff = (actual - expected).abs()
+                # Diagnostic only: both tensors are now on CPU, outside timing.
+                case = {
+                    "K": inner,
+                    "signed": signed,
+                    "transposed": transposed,
+                    "num_stages": args.num_stages,
+                    "mismatch": int((diff != 0).sum()),
+                    "max_abs": float(diff.max()),
+                }
+                results.append(case)
+                print(json.dumps(case), flush=True)
+    if any(case["mismatch"] for case in results):
+        raise AssertionError("Layout regression failed; do not run timing, profiling or full-model validation")
+    return {"layout_check": "passed", "cases": len(results), "num_stages": args.num_stages}
+
 
 def qbmm_reference(x, weight, sx, sw, output_dtype):
     """Same INT8 data/scales as Triton; include slice copies and output stack."""
@@ -120,14 +171,16 @@ def run(args):
     block_shape = tuple(args.block_shape) if args.block_shape else None
 
     def fused():
-        return transpose_quant_batch_matmul(x, weight, sx, sw, block_shape=block_shape)
+        return transpose_quant_batch_matmul(x, weight, sx, sw, block_shape=block_shape, num_stages=args.num_stages)
 
     def reference():
         return qbmm_reference(x, weight, sx, sw, torch.bfloat16)
 
     actual, expected = fused(), reference()
     torch.testing.assert_close(actual, expected, rtol=0.01, atol=0.02)
-    dynamic_actual = dynamic_quant_grouped_wo_a(activations, weight, sw, block_shape=block_shape)
+    dynamic_actual = dynamic_quant_grouped_wo_a(
+        activations, weight, sw, block_shape=block_shape, num_stages=args.num_stages
+    )
     dynamic_expected = dynamic_qbmm_reference(activations, weight, sw)
     torch.testing.assert_close(dynamic_actual, dynamic_expected, rtol=0.01, atol=0.02)
     report = {
@@ -136,6 +189,8 @@ def run(args):
         "quant_model": str(args.quant_model) if args.quant_model else None,
         "torch": torch.__version__,
         "torch_npu": torch_npu.__version__,
+        "num_stages": args.num_stages,
+        "requested_block_shape": block_shape,
         "same_int8_inputs": error_metrics(actual, expected),
         "including_dynamic_quant": error_metrics(dynamic_actual, dynamic_expected),
         "note": "Compares with the existing INT8 composition, not original BF16/FP8 model accuracy.",
@@ -145,7 +200,9 @@ def run(args):
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
-            captured = dynamic_quant_grouped_wo_a(activations, weight, sw, block_shape=block_shape)
+            captured = dynamic_quant_grouped_wo_a(
+                activations, weight, sw, block_shape=block_shape, num_stages=args.num_stages
+            )
         # Replay with changed inputs, not just a repeated captured answer.
         activations.mul_(0.5)
         graph.replay()
@@ -156,7 +213,9 @@ def run(args):
         fused_ms = elapsed_ms(fused, args.warmup, args.iterations)
         reference_ms = elapsed_ms(reference, args.warmup, args.iterations)
         dynamic_ms = elapsed_ms(
-            lambda: dynamic_quant_grouped_wo_a(activations, weight, sw, block_shape=block_shape),
+            lambda: dynamic_quant_grouped_wo_a(
+                activations, weight, sw, block_shape=block_shape, num_stages=args.num_stages
+            ),
             args.warmup,
             args.iterations,
         )
@@ -184,6 +243,14 @@ def parse_args():
     parser.add_argument("--tp-size", type=int, default=8)
     parser.add_argument("--tp-rank", type=int, default=0)
     parser.add_argument("--block-shape", type=int, nargs=3, metavar=("M", "N", "K"))
+    parser.add_argument(
+        "--num-stages",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="1 disables automatic multi-buffering; 2 enables automatic mode (not an exact buffer count)",
+    )
+    parser.add_argument("--layout-check", action="store_true", help="Run the eight CPU-golden layout regression cases")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=30)
@@ -196,4 +263,6 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    print(json.dumps(run(parse_args()), indent=2))
+    arguments = parse_args()
+    result = check_weight_layouts(arguments) if arguments.layout_check else run(arguments)
+    print(json.dumps(result, indent=2))
