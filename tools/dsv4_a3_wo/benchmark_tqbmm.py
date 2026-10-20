@@ -60,6 +60,7 @@ def check_weight_layouts(args):
                     "signed": signed,
                     "transposed": transposed,
                     "num_stages": args.num_stages,
+                    "weight_stride": list(weight.stride()),
                     "mismatch": int((diff != 0).sum()),
                     "max_abs": float(diff.max()),
                 }
@@ -68,6 +69,74 @@ def check_weight_layouts(args):
     if any(case["mismatch"] for case in results):
         raise AssertionError("Layout regression failed; do not run timing, profiling or full-model validation")
     return {"layout_check": "passed", "cases": len(results), "num_stages": args.num_stages}
+
+
+@torch.inference_mode()
+def check_k_loop(args):
+    """Keep physical K pitch fixed while comparing sliced and full K loops.
+
+    Unit scales and small integers make FP32 outputs exact. CPU FP64 is the
+    independent golden; slicing the weight must NOT materialize a contiguous
+    copy. A single K tile can therefore still have a column pitch of 4096.
+    """
+    if not torch.npu.is_available() or get_ascend_device_type() != AscendDeviceType.A3:
+        raise RuntimeError("This probe requires an Ascend A3 NPU and Triton-Ascend")
+    torch.npu.set_device(args.device)
+    torch.manual_seed(args.seed)
+    inner = LAYOUT_CHECK_INNER_SIZES[-1]
+    block_k = LAYOUT_CHECK_INNER_SIZES[0]
+    x_cpu = torch.randint(-8, 9, (LAYOUT_CHECK_TOKENS, 1, inner), dtype=torch.int8)
+    w_cpu = torch.randint(-8, 9, (1, LAYOUT_CHECK_COLUMNS, inner), dtype=torch.int8)
+    x = x_cpu.to(args.device)
+    weight = w_cpu.to(args.device).transpose(1, 2)
+    sx = torch.ones(LAYOUT_CHECK_TOKENS, 1, device=args.device, dtype=torch.float32)
+    sw = torch.ones(1, LAYOUT_CHECK_COLUMNS, device=args.device, dtype=torch.float32)
+    # Nonzero offsets and a masked tail; every view retains the same K pitch.
+    spans = (
+        (0, block_k),
+        (block_k, 2 * block_k),
+        (inner // 2, inner // 2 + block_k),
+        (inner - block_k, inner),
+        (0, 2 * block_k),
+        (0, 2 * block_k + 1),
+        (0, inner),
+    )
+    results = []
+    for start, end in spans:
+        x_view = x[:, :, start:end]
+        w_view = weight[:, start:end, :]
+        expected = (
+            torch.bmm(
+                x_cpu[:, :, start:end].double().transpose(0, 1),
+                w_cpu[:, :, start:end].double().transpose(1, 2),
+            )
+            .transpose(0, 1)
+            .float()
+        )
+        actual = transpose_quant_batch_matmul(
+            x_view,
+            w_view,
+            sx,
+            sw,
+            output_dtype=torch.float32,
+            block_shape=(LAYOUT_CHECK_TOKENS, LAYOUT_CHECK_COLUMNS, block_k),
+            num_stages=args.num_stages,
+        ).cpu()
+        diff = (actual - expected).abs()
+        case = {
+            "k_span": [start, end],
+            "logical_K": end - start,
+            "weight_stride": list(w_view.stride()),
+            "weight_storage_offset": w_view.storage_offset(),
+            "num_stages": args.num_stages,
+            "mismatch": int((diff != 0).sum()),
+            "max_abs": float(diff.max()),
+        }
+        print(json.dumps(case), flush=True)
+        results.append(case)
+    if any(case["mismatch"] for case in results):
+        raise AssertionError("K-loop/pitch isolation failed; retain all seven case reports")
+    return {"k_loop_check": "passed", "cases": len(results), "num_stages": args.num_stages}
 
 
 def qbmm_reference(x, weight, sx, sw, output_dtype):
@@ -250,7 +319,9 @@ def parse_args():
         default=1,
         help="1 disables automatic multi-buffering; 2 enables automatic mode (not an exact buffer count)",
     )
-    parser.add_argument("--layout-check", action="store_true", help="Run the eight CPU-golden layout regression cases")
+    checks = parser.add_mutually_exclusive_group()
+    checks.add_argument("--layout-check", action="store_true", help="Run the eight CPU-golden layout regression cases")
+    checks.add_argument("--k-loop-check", action="store_true", help="Isolate K loops at fixed transposed weight pitch")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=30)
@@ -264,5 +335,10 @@ def parse_args():
 
 if __name__ == "__main__":
     arguments = parse_args()
-    result = check_weight_layouts(arguments) if arguments.layout_check else run(arguments)
+    if arguments.k_loop_check:
+        result = check_k_loop(arguments)
+    elif arguments.layout_check:
+        result = check_weight_layouts(arguments)
+    else:
+        result = run(arguments)
     print(json.dumps(result, indent=2))

@@ -99,14 +99,14 @@ def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided, block_shap
     tokens, groups, inner, columns = shape
     rng = np.random.default_rng(0)
     if strided:
-        x_storage = rng.integers(-128, 128, (groups, tokens, inner * 2), dtype=np.int8)
-        x = x_storage.transpose(1, 0, 2)[:, :, ::2]
-        w_storage = rng.integers(-128, 128, (groups, columns, inner), dtype=np.int8)
-        weight = w_storage.transpose(0, 2, 1)
-        sx_storage = rng.random((groups, tokens * 2), dtype=np.float32)
-        sx = sx_storage[:, ::2].T
-        sw_storage = rng.random((columns, groups), dtype=np.float32)
-        sw = sw_storage.T
+        x_storage = rng.integers(-128, 128, (groups, tokens + 1, inner * 2 + 2), dtype=np.int8)
+        x = x_storage[:, 1:, 1 : 1 + inner * 2 : 2].transpose(1, 0, 2)
+        w_storage = rng.integers(-128, 128, (groups, columns, inner + 2), dtype=np.int8)
+        weight = w_storage[:, :, 1:-1].transpose(0, 2, 1)
+        sx_storage = rng.random((groups, tokens * 2 + 2), dtype=np.float32)
+        sx = sx_storage[:, 1 : 1 + tokens * 2 : 2].T
+        sw_storage = rng.random((columns + 1, groups + 1), dtype=np.float32)
+        sw = sw_storage[1:, 1:].T
     else:
         x_storage = rng.integers(-128, 128, (tokens, groups, inner), dtype=np.int8)
         w_storage = rng.integers(-128, 128, (groups, inner, columns), dtype=np.int8)
@@ -121,10 +121,10 @@ def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided, block_shap
         for pid in range(num_tiles):
             kernel = load_function("_transpose_quant_batch_matmul_kernel", {"tl": Language(pid, group)})
             kernel(
-                Pointer(x_storage),
-                Pointer(w_storage),
-                Pointer(sx_storage),
-                Pointer(sw_storage),
+                Pointer(x_storage, (x.ctypes.data - x_storage.ctypes.data) // x.itemsize),
+                Pointer(w_storage, (weight.ctypes.data - w_storage.ctypes.data) // weight.itemsize),
+                Pointer(sx_storage, (sx.ctypes.data - sx_storage.ctypes.data) // sx.itemsize),
+                Pointer(sw_storage, (sw.ctypes.data - sw_storage.ctypes.data) // sw.itemsize),
                 Pointer(actual),
                 tokens,
                 groups,
@@ -138,6 +138,45 @@ def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided, block_shap
             )
     integer_golden = np.einsum("tgk,gkn->tgn", x.astype(np.int64), weight.astype(np.int64))
     expected = (integer_golden.astype(np.float32) * sw[None]) * sx[:, :, None]
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("start,end", [(0, 32), (32, 64), (2048, 2080), (4064, 4096), (0, 64), (0, 65), (0, 4096)])
+def test_fixed_physical_weight_pitch_with_logical_k_slices(start, end):
+    """Physical column stride stays 4096 even when logical K is 32 or 65."""
+    tokens, groups, physical_k, columns = 17, 2, 4096, 33
+    rng = np.random.default_rng(1)
+    x_storage = rng.integers(-128, 128, (tokens, groups, physical_k), dtype=np.int8)
+    w_storage = rng.integers(-128, 128, (groups, columns, physical_k), dtype=np.int8)
+    x = x_storage[:, :, start:end]
+    weight = w_storage[:, :, start:end].transpose(0, 2, 1)
+    sx = rng.random((tokens, groups), dtype=np.float32)
+    sw = rng.random((groups, columns), dtype=np.float32)
+    actual = np.full((tokens, groups, columns), np.nan, dtype=np.float32)
+    strides = tuple(step // value.itemsize for value in (x, weight, sx, sw) for step in value.strides)
+    block_m, block_n, block_k = 16, 32, 32
+    num_tiles = Language.cdiv(tokens, block_m) * Language.cdiv(columns, block_n)
+    for group in range(groups):
+        for pid in range(num_tiles):
+            kernel = load_function("_transpose_quant_batch_matmul_kernel", {"tl": Language(pid, group)})
+            kernel(
+                Pointer(x_storage, start),
+                Pointer(w_storage, start),
+                Pointer(sx),
+                Pointer(sw),
+                Pointer(actual),
+                tokens,
+                groups,
+                end - start,
+                columns,
+                *strides,
+                block_m,
+                block_n,
+                block_k,
+                4,
+            )
+    golden = np.einsum("tgk,gkn->tgn", x.astype(np.int64), weight.astype(np.int64))
+    expected = (golden.astype(np.float32) * sw[None]) * sx[:, :, None]
     np.testing.assert_array_equal(actual, expected)
 
 

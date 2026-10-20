@@ -60,15 +60,18 @@ def _transpose_quant_batch_matmul_kernel(
     rows = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
     cols = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
     inner = tl.arange(0, BLOCK_K).to(tl.int64)
-    x = x_ptr + rows[:, None] * stride_xt + group * stride_xg + inner[None, :] * stride_xk
-    w = w_ptr + group * stride_wg + inner[:, None] * stride_wk + cols[None, :] * stride_wn
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
     for step in range(tl.cdiv(K, BLOCK_K)):
-        a = tl.load(x, mask=(rows[:, None] < T) & (inner[None, :] + step * BLOCK_K < K), other=0)
-        b = tl.load(w, mask=(inner[:, None] + step * BLOCK_K < K) & (cols[None, :] < N), other=0)
+        # Reconstruct addresses from the immutable bases, not loop-carried
+        # pointer tensors. The same absolute K indices drive loads and masks.
+        # A [G,N,K] backing allocation viewed as [G,K,N] has stride_wk=1,
+        # stride_wn=physical K pitch; do not substitute the logical slice K.
+        current_k = inner + step * BLOCK_K
+        x = x_ptr + rows[:, None] * stride_xt + group * stride_xg + current_k[None, :] * stride_xk
+        w = w_ptr + group * stride_wg + current_k[:, None] * stride_wk + cols[None, :] * stride_wn
+        a = tl.load(x, mask=(rows[:, None] < T) & (current_k[None, :] < K), other=0)
+        b = tl.load(w, mask=(current_k[:, None] < K) & (cols[None, :] < N), other=0)
         accumulator = tl.dot(a, b, accumulator, out_dtype=tl.int32)
-        x += BLOCK_K * stride_xk
-        w += BLOCK_K * stride_wk
 
     sx = tl.load(sx_ptr + rows * stride_sxt + group * stride_sxg, mask=rows < T, other=0)
     sw = tl.load(sw_ptr + group * stride_swg + cols * stride_swn, mask=cols < N, other=0)
@@ -122,8 +125,10 @@ def transpose_quant_batch_matmul(
     supported. ``block_shape`` overrides the conservative, untuned defaults.
     ``num_stages=1`` disables Ascend automatic multi-buffering for correctness
     isolation; ``2`` restores automatic mode, not an exact two-buffer count.
-    This is a candidate workaround for strided multi-K failures, not a verified
-    compiler fix. No copies, CPU fallback or catch-and-retry path are added.
+    Disabling multi-buffering alone did not fix the reported strided multi-K
+    failure. Addresses are now reconstructed per iteration for isolation;
+    device validation is still required. No copies, CPU fallback or
+    catch-and-retry path are added.
     """
     _validate_inputs(x, weight, x_scale, weight_scale, output_dtype)
     _validate_num_stages(num_stages)

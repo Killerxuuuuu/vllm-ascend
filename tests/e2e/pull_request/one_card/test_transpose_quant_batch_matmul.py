@@ -45,6 +45,58 @@ def test_transposed_weight_multi_k_regression(inner, signed, transposed):
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("start,end", [(0, 32), (32, 64), (2048, 2080), (4064, 4096), (0, 64), (0, 65), (0, 4096)])
+def test_transposed_weight_fixed_pitch_k_slices(start, end):
+    tokens, groups, physical_k, columns = 16, 1, 4096, 32
+    torch.manual_seed(0)
+    x_cpu = torch.randint(-8, 9, (tokens, groups, physical_k), dtype=torch.int8)
+    w_cpu = torch.randint(-8, 9, (groups, columns, physical_k), dtype=torch.int8)
+    x = x_cpu.npu()[:, :, start:end]
+    weight = w_cpu.npu().transpose(1, 2)[:, start:end, :]
+    assert weight.stride() == (columns * physical_k, 1, physical_k)
+    assert weight.storage_offset() == start
+    expected = (
+        torch.bmm(
+            x_cpu[:, :, start:end].double().transpose(0, 1),
+            w_cpu[:, :, start:end].double().transpose(1, 2),
+        )
+        .transpose(0, 1)
+        .float()
+    )
+    actual = transpose_quant_batch_matmul(
+        x,
+        weight,
+        torch.ones(tokens, groups, device="npu", dtype=torch.float32),
+        torch.ones(groups, columns, device="npu", dtype=torch.float32),
+        output_dtype=torch.float32,
+        block_shape=(16, 32, 32),
+        num_stages=1,
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+def test_transposed_multi_k_tail_and_distinct_group_scales():
+    tokens, groups, inner, columns = 17, 2, 4099, 33
+    torch.manual_seed(0)
+    x_cpu = torch.randint(-8, 9, (tokens, groups, inner), dtype=torch.int8)
+    w_cpu = torch.randint(-8, 9, (groups, columns, inner), dtype=torch.int8)
+    # Exact powers of two, different for tokens, groups and output channels.
+    sx = torch.pow(2.0, -(torch.arange(tokens * groups).reshape(tokens, groups) % 4) - 4)
+    sw = torch.pow(2.0, torch.arange(groups * columns).reshape(groups, columns) % 5 - 4)
+    golden = torch.bmm(x_cpu.double().transpose(0, 1), w_cpu.double().transpose(1, 2)).transpose(0, 1)
+    expected = ((golden * sw.double()[None]) * sx.double()[:, :, None]).float()
+    actual = transpose_quant_batch_matmul(
+        x_cpu.npu(),
+        w_cpu.npu().transpose(1, 2),
+        sx.npu(),
+        sw.npu(),
+        output_dtype=torch.float32,
+        block_shape=(16, 32, 32),
+        num_stages=1,
+    )
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("shape", [(1, 1, 64, 32), (17, 2, 65, 33), (65, 3, 129, 131), (513, 2, 64, 129)])
 @pytest.mark.parametrize("transposed_weight", [False, True])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float32])
