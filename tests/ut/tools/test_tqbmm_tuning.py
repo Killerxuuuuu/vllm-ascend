@@ -7,6 +7,7 @@ Run with --noconftest. These do not validate NPU compilation/performance.
 import ast
 import json
 import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,16 +17,36 @@ import pytest
 
 from tools.dsv4_a3_wo.tune_tqbmm import (
     Candidate,
+    WorkerFailure,
+    best_configuration,
     candidates,
     extract_report,
     main,
     rankings,
     run_worker,
     save_reports,
+    search_candidates,
     validate_exact_report,
 )
 
 BENCHMARK_PATH = Path(__file__).resolve().parents[3] / "tools/dsv4_a3_wo/benchmark_tqbmm.py"
+REPO_ROOT = BENCHMARK_PATH.parents[2]
+
+
+def search_args(**overrides):
+    values = {
+        "search_space": "balanced",
+        "block_m": None,
+        "block_n": None,
+        "block_k": None,
+        "stages": None,
+        "candidate": None,
+        "extended": False,
+        "ub_budget_kib": 192,
+        "transpose_weight_tile": False,
+        "tile_loads": None,
+    }
+    return SimpleNamespace(**(values | overrides))
 
 
 def exact_report():
@@ -64,6 +85,86 @@ def test_experimental_tile_load_is_explicit():
     assert all(not choice.transpose_weight_tile for choice in candidates())
     assert "--transpose-weight-tile" not in Candidate(16, 32, 32, 1).options()
     assert "--transpose-weight-tile" in Candidate(16, 32, 32, 1, True).options()
+
+
+def test_balanced_scan_includes_measured_s2_despite_heuristic_budget():
+    plan = search_candidates(search_args())
+    measured = Candidate(32, 32, 64, 2)
+    assert plan[:2] == [Candidate(16, 32, 32, 1), measured]
+    assert measured.estimated_ub_bytes > 192 * 1024
+    assert len(plan) == 18
+    assert all(not choice.transpose_weight_tile for choice in plan)
+
+
+def test_grid_scans_every_unique_axis_combination_and_keeps_control():
+    plan = search_candidates(
+        search_args(search_space="grid", block_m=[32, 32], block_n=[16, 32], block_k=[64], stages=[1, 2])
+    )
+    expected = {Candidate(32, n, 64, stage) for n in (16, 32) for stage in (1, 2)}
+    assert set(plan) == expected | {Candidate(16, 32, 32, 1)}
+    assert len(plan) == 5
+
+
+@pytest.mark.parametrize("mode,multiplier", [("direct", 1), ("nk", 1), ("both", 2)])
+def test_explicit_candidates_and_tile_load_modes(mode, multiplier):
+    plan = search_candidates(search_args(candidate=[[32, 32, 64, 2]], tile_loads=mode))
+    assert plan[0] == Candidate(16, 32, 32, 1)
+    assert len(plan) == 1 + multiplier
+    if mode == "nk":
+        assert plan[1].transpose_weight_tile
+
+
+def test_extended_128_k_trials_are_explicit_and_not_128_n_by_128_k():
+    regular = search_candidates(search_args())
+    extended = search_candidates(search_args(extended=True))
+    assert all(choice.block_k <= 64 for choice in regular)
+    assert Candidate(32, 16, 128, 1) in extended
+    assert Candidate(16, 32, 128, 2) in extended
+    assert all(choice.block_n < 128 or choice.block_k < 128 for choice in extended)
+
+
+@pytest.mark.parametrize(
+    "values", [(8, 32, 64, 1), (24, 32, 64, 1), (32, 32, 16, 1), (32, 32, 64, 3), (32, 128, 128, 1), (256, 32, 64, 1)]
+)
+def test_invalid_or_historical_overflow_tiles_rejected_before_launch(values):
+    with pytest.raises(ValueError):
+        search_candidates(search_args(candidate=[values]))
+
+
+def test_grid_axes_not_silently_ignored_in_other_search_modes():
+    with pytest.raises(ValueError, match="require"):
+        search_candidates(search_args(block_m=[32]))
+    with pytest.raises(ValueError, match="not both"):
+        search_candidates(search_args(search_space="grid", block_m=[32], candidate=[[32, 32, 64, 2]]))
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--search-space", "balanced", "--max-candidates", "2"],
+        ["--timing-mode", "eager", "--selection-mode", "graph"],
+        ["--tp-size", "8", "--tp-rank", "8"],
+        ["--layer", "-1"],
+    ],
+)
+def test_invalid_scan_arguments_do_not_spawn_workers(options):
+    with patch("tools.dsv4_a3_wo.tune_tqbmm.subprocess.run") as worker, pytest.raises(SystemExit):
+        main(["--quant-model", "unused", "--dry-run", *options])
+    worker.assert_not_called()
+
+
+def test_root_launcher_dry_run_is_cpu_only_and_includes_new_best():
+    process = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "autotune_tqbmm.py"), "--quant-model", "unused", "--dry-run"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    plan = json.loads(process.stdout)
+    assert len(plan) == 18
+    assert plan[1]["tag"] == "m32n32k64s2"
+    assert "torch" not in process.stderr
 
 
 def test_extract_report_skips_import_logs_and_case_json():
@@ -113,6 +214,40 @@ def test_rankings_exclude_rejected_partial_candidates():
         {"tag": "wrong", "status": "rejected", "reports": {"16": invalid}},
     ]
     assert rankings(results, [16])["16"]["eager"]["candidate"] == "safe"
+
+
+def test_single_best_uses_all_shapes_not_only_the_fastest_individual_case():
+    def result(tag, durations):
+        reports = {}
+        for tokens, duration in zip((1, 512), durations):
+            report = exact_report()
+            report["graph_timing_ms"]["triton_prequantized"] = duration
+            reports[str(tokens)] = report
+        return {"tag": tag, "status": "passed", "reports": reports}
+
+    results = [result("great_at_one_token", [0.01, 0.4]), result("balanced", [0.02, 0.1])]
+    winner = best_configuration(results, [1, 512])
+    assert winner["candidate"] == "balanced"
+    assert winner["score_geometric_mean_ms"] == pytest.approx((0.02 * 0.1) ** 0.5)
+    assert rankings(results, [1, 512])["1"]["graph"]["candidate"] == "great_at_one_token"
+
+
+def test_single_best_obeys_objective_and_rejects_pending_partial_and_nonfinite():
+    fast_prequant = exact_report()
+    fast_dynamic = exact_report()
+    fast_dynamic["graph_timing_ms"]["triton_prequantized"] = 0.2
+    fast_dynamic["graph_timing_ms"]["triton_including_quant"] = 0.12
+    results = [
+        {"tag": "prequant", "status": "passed", "reports": {"16": fast_prequant}},
+        {"tag": "dynamic", "status": "passed", "reports": {"16": fast_dynamic}},
+        {"tag": "pending", "status": "pending", "reports": {"16": fast_prequant}},
+        {"tag": "partial", "status": "rejected", "reports": {"16": fast_prequant}},
+    ]
+    assert best_configuration(results, [16])["candidate"] == "prequant"
+    assert best_configuration(results, [16], objective="including_quant")["candidate"] == "dynamic"
+    assert best_configuration(results, [16, 512]) is None
+    fast_prequant["graph_timing_ms"]["triton_prequantized"] = float("nan")
+    assert best_configuration(results, [16])["candidate"] == "dynamic"
 
 
 @pytest.mark.parametrize("returncode", [0, 1])
@@ -205,6 +340,114 @@ def test_partial_fast_candidate_does_not_win_when_later_shape_fails(tmp_path):
     assert rejected["status"] == "rejected"
     assert "512" not in rejected["reports"]
     assert all(value["eager"]["candidate"] != rejected["tag"] for value in saved["best_measured"].values())
+
+
+def successful_worker(command, log, timeout, expected_key):
+    if expected_key in ("layout_check", "k_loop_check"):
+        measurements = {expected_key: "passed"}
+    else:
+        measurements = exact_report()
+        tokens = int(command[command.index("--tokens") + 1])
+        measurements["shape_T_G_K_N"] = [tokens, 1, 4096, 1024]
+        stages = int(command[command.index("--num-stages") + 1])
+        if stages == 2:
+            measurements["graph_timing_ms"]["triton_prequantized"] = 0.07
+    log.write_text(json.dumps(measurements), encoding="utf-8")
+    return measurements
+
+
+def scan_options(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    return [
+        "--quant-model",
+        str(model),
+        "--output",
+        str(tmp_path / "scan"),
+        "--candidate",
+        "32",
+        "32",
+        "64",
+        "2",
+        "--tokens",
+        "1",
+        "512",
+    ]
+
+
+def test_complete_scan_records_every_trial_wall_time_and_reusable_winner(tmp_path):
+    options = scan_options(tmp_path)
+    with patch("tools.dsv4_a3_wo.tune_tqbmm.run_worker", side_effect=successful_worker) as worker:
+        assert main(options) == 0
+    assert worker.call_count == 8
+    output = tmp_path / "scan"
+    report = json.loads((output / "results.json").read_text())
+    assert report["run_status"] == "completed"
+    assert len(report["results"]) == 2
+    assert all(result["status"] == "passed" for result in report["results"])
+    assert all(result["wall_seconds"] >= 0 for result in report["results"])
+    assert all(trial["wall_seconds"] >= 0 for result in report["results"] for trial in result["trials"])
+    best = json.loads((output / "best_config.json").read_text())
+    assert best["overall_best"]["candidate"] == "m32n32k64s2"
+    assert best["overall_best"]["parameters"] == {
+        "block_m": 32,
+        "block_n": 32,
+        "block_k": 64,
+        "num_stages": 2,
+        "transpose_weight_tile": False,
+    }
+    assert best["overall_best"]["benchmark_options"] == ["--block-shape", "32", "32", "64", "--num-stages", "2"]
+    assert len((output / "candidates.csv").read_text().splitlines()) == 3
+    assert len((output / "trials.csv").read_text().splitlines()) == 9
+    assert not list(output.glob("*.tmp"))
+
+
+def test_interrupt_keeps_completed_best_and_marks_remaining_work(tmp_path):
+    options = scan_options(tmp_path)
+
+    def worker(command, log, timeout, expected_key):
+        if command[command.index("--num-stages") + 1] == "2":
+            raise KeyboardInterrupt
+        return successful_worker(command, log, timeout, expected_key)
+
+    with patch("tools.dsv4_a3_wo.tune_tqbmm.run_worker", side_effect=worker):
+        assert main(options) == 130
+    saved = json.loads((tmp_path / "scan" / "results.json").read_text())
+    assert saved["run_status"] == "interrupted"
+    assert saved["results"][1]["status"] == "interrupted"
+    assert saved["results"][1]["trials"][0]["status"] == "interrupted"
+    best = json.loads((tmp_path / "scan" / "best_config.json").read_text())
+    assert best["overall_best"]["candidate"] == "m16n32k32s1"
+
+
+def test_device_error_stops_search_without_timing_a_fallback(tmp_path):
+    options = scan_options(tmp_path)
+    options.extend(["--candidate", "64", "32", "32", "1"])
+
+    def worker(command, log, timeout, expected_key):
+        if command[command.index("--num-stages") + 1] == "2":
+            raise WorkerFailure("device lost", "device_error")
+        return successful_worker(command, log, timeout, expected_key)
+
+    with patch("tools.dsv4_a3_wo.tune_tqbmm.run_worker", side_effect=worker):
+        assert main(options) == 1
+    saved = json.loads((tmp_path / "scan" / "results.json").read_text())
+    assert saved["run_status"] == "device_error"
+    assert saved["results"][1]["status"] == "rejected"
+    assert saved["results"][2]["status"] == "pending"
+
+
+def test_existing_output_is_never_overwritten(tmp_path):
+    options = scan_options(tmp_path)
+    output = tmp_path / "scan"
+    output.mkdir()
+    sentinel = output / "keep.txt"
+    sentinel.write_text("user output")
+    with patch("tools.dsv4_a3_wo.tune_tqbmm.run_worker") as worker, pytest.raises(FileExistsError):
+        main(options)
+    worker.assert_not_called()
+    assert sentinel.read_text() == "user output"
 
 
 @pytest.mark.parametrize("mode", ["eager", "graph"])

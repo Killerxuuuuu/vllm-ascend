@@ -24,7 +24,15 @@ T=1/16/64/512 在 `16 32 32`、`num_stages=1` 下，两种数值比较均为 max
 源码本来就有 `tl.dot`；仅看到 AIV 侧 load/cast/deinterleave，不能推断 Cube 没有运行。
 T 增长 512 倍而耗时增长约 8 倍，也不应描述为相对 T 的超线性增长。
 
-### 一条命令跑带精确数值门禁的调优
+### 根目录自动搜索入口（推荐）
+
+新增 `python autotune_tqbmm.py --quant-model "$QUANT_MODEL"`，默认扫描 18 组受控组合，
+包含已实测的 `(32,32,64,s2)`，并保存 `best_config.json`、逐候选状态和完整墙钟耗时。
+支持自定义 M/N/K/stages 网格与显式候选；不会自动修改 kernel 默认值。
+新搜索只记录 UB 估算，不根据估算过滤已实测可用配置。
+完整运行命令、输出解释及选择规则见仓库根目录的 [AUTOTUNE_TQBMM.md](../../AUTOTUNE_TQBMM.md)。
+
+### 旧版有限候选调优（兼容）
 
 使用运行 vLLM 的 Python，不使用 ModelSlim/AISBench 的虚拟环境：
 
