@@ -370,3 +370,14 @@ def test_addback_cli_is_opt_in_and_compatible_with_other_modes(breakdown, capsys
         assert name not in diagnostic.GRAPH_CASES
     args = diagnostic.parse_args(["--quant-model", "unused"])
     assert not args.validation_addback
+
+
+def test_prepared_cli_includes_safe_and_graph_cases_without_changing_defaults(capsys):
+    assert diagnostic.main(["--quant-model", "unused", "--include-qbmm", "--prepared", "--dry-run"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert tuple(report["cases"]) == diagnostic.CASES + diagnostic.NATIVE_CASES + diagnostic.PREPARED_CASES
+    assert report["settings"]["prepared"]
+    assert "prepared_note" in report
+    assert "P_graph_prepared" in diagnostic.GRAPH_CASES
+    assert "S_safe_out" not in diagnostic.GRAPH_CASES
+    assert not diagnostic.parse_args(["--quant-model", "unused"]).prepared

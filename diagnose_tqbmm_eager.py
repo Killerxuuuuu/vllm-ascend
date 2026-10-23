@@ -22,9 +22,10 @@ from statistics import median
 REPO_ROOT = Path(__file__).resolve().parent
 CASES = ("A_full", "B_unchecked_alloc", "C_unchecked_reuse", "D_graph_full")
 NATIVE_CASES = ("R_qbmm_eager", "R_qbmm_graph")
+PREPARED_CASES = ("S_safe_out", "P_prepared_reuse", "P_graph_prepared")
 VALIDATION_CASES = ("V_control", "V_input_metadata", "V_option_metadata", "V_format", "V_all")
 ADDBACK_CHECKS = ("empty_call_control", "input_metadata", "option_metadata", "format_all_four", "all_validation")
-GRAPH_CASES = ("D_graph_full", "R_qbmm_graph")
+GRAPH_CASES = ("D_graph_full", "R_qbmm_graph", "P_graph_prepared")
 TIMING_FIELDS = ("host_submit_us", "stream_us", "wall_us")
 GRAPH_WARMUP_REPLAYS = 3
 
@@ -49,6 +50,7 @@ def parse_args(argv=None):
     parser.add_argument("--check-breakdown", action="store_true", help="Separately time validation/format queries")
     parser.add_argument("--check-iterations", type=int, default=2048)
     parser.add_argument("--include-qbmm", action="store_true", help="Include same-run native composition Eager/Graph")
+    parser.add_argument("--prepared", action="store_true", help="Measure safe out and validated fixed-buffer APIs")
     parser.add_argument(
         "--validation-addback", action="store_true", help="Add checks back to the identical B launch path"
     )
@@ -290,6 +292,7 @@ def run_device(args, report, output):
     from tools.dsv4_a3_wo.benchmark_tqbmm import load_wo_a, qbmm_reference
     from vllm_ascend.ops.triton.transpose_quant_batch_matmul import (
         DEFAULT_GROUP_SIZE_M,
+        PreparedTQBMM,
         _transpose_quant_batch_matmul_kernel,
         _validate_inputs,
         _validate_num_stages,
@@ -358,6 +361,36 @@ def run_device(args, report, output):
                 return qbmm_reference(x, weight, sx, sw, torch.bfloat16)
 
             functions = dict(zip(CASES[:3], (full, unchecked_alloc, unchecked_reuse)))
+            prepared = None
+            if args.prepared:
+                safe_output = torch.empty((tokens, groups, columns), dtype=torch.bfloat16, device=args.device)
+
+                def safe_out(x=x, sx=sx, out=safe_output):
+                    return transpose_quant_batch_matmul(
+                        x,
+                        weight,
+                        sx,
+                        sw,
+                        output_dtype=torch.bfloat16,
+                        block_shape=tuple(args.block_shape),
+                        num_stages=args.num_stages,
+                        transpose_weight_tile=args.transpose_weight_tile,
+                        out=out,
+                    )
+
+                prepared = PreparedTQBMM(
+                    x,
+                    weight,
+                    sx,
+                    sw,
+                    output_dtype=torch.bfloat16,
+                    block_shape=tuple(args.block_shape),
+                    num_stages=args.num_stages,
+                    transpose_weight_tile=args.transpose_weight_tile,
+                )
+                prepared.output.fill_(float("nan"))
+                functions[PREPARED_CASES[0]] = safe_out
+                functions[PREPARED_CASES[1]] = prepared
             checks = {}
             if args.check_breakdown or args.validation_addback:
                 checks = validation_functions(
@@ -386,6 +419,8 @@ def run_device(args, report, output):
             graph_sources = {CASES[3]: full}
             if args.include_qbmm:
                 graph_sources[NATIVE_CASES[1]] = reference
+            if prepared is not None:
+                graph_sources[PREPARED_CASES[2]] = prepared
             graphs = {}
             for name, function in graph_sources.items():
                 graphs[name] = capture_graph(function, torch.npu, args.graph_batch_size)
@@ -416,6 +451,7 @@ def run_device(args, report, output):
                 CASES
                 + (NATIVE_CASES if args.include_qbmm else ())
                 + (VALIDATION_CASES if args.validation_addback else ())
+                + (PREPARED_CASES if args.prepared else ())
             )
             if args.check_breakdown:
                 for function in checks.values():
@@ -506,6 +542,20 @@ def main(argv=None):
             "V_all with A estimates remaining wrapper/order differences, not a proved runtime defect. "
             "V format checks precede allocation; the public wrapper checks format after allocation. "
             "All V cases pass the same strict original/changed-input gates before timing."
+        )
+    if args.prepared:
+        report["cases"].update(
+            {
+                "S_safe_out": "Public out API: full validation including allocation-alias rejection on every call",
+                "P_prepared_reuse": "Validated fixed-buffer binding: cached geometry/config, serial owned output",
+                "P_graph_prepared": "Graph replay of the same fixed-buffer binding, reusing its one serial output",
+            }
+        )
+        report["prepared_note"] = (
+            "Preparation validates all inputs/output and geometry before timing. No unchecked diagnostic shortcut. "
+            "Bindings retain detached tensor views; input copy_ updates remain visible. No metadata/storage mutation. "
+            "Output is consumed before serial reuse. Not a concurrent serving benchmark or automatic model wiring. "
+            "Graph capture and JIT compilation are excluded; strict changed-input gates apply to all paths."
         )
     if args.check_breakdown:
         report["check_note"] = (

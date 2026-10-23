@@ -7,6 +7,7 @@ import torch_npu
 
 from tools.dsv4_a3_wo.benchmark_tqbmm import dynamic_qbmm_reference, qbmm_reference
 from vllm_ascend.ops.triton.transpose_quant_batch_matmul import (
+    PreparedTQBMM,
     dynamic_quant_grouped_wo_a,
     transpose_quant_batch_matmul,
 )
@@ -187,3 +188,91 @@ def test_graph_replay_reads_updated_inputs():
     graph.replay()
     torch.npu.synchronize()
     torch.testing.assert_close(actual, dynamic_qbmm_reference(x, w, sw), rtol=0.01, atol=0.02)
+
+
+@pytest.mark.parametrize("tokens", [1, 16, 64, 512])
+def test_prepared_real_dimensions_strict_and_changed_inputs(tokens):
+    torch.manual_seed(0)
+    x = torch.randint(-8, 9, (tokens, 1, 4096), dtype=torch.int8, device="npu")
+    weight = torch.randint(-8, 9, (1, 1024, 4096), dtype=torch.int8, device="npu").transpose(1, 2)
+    sx = torch.full((tokens, 1), 0.125, device="npu")
+    sw = torch.full((1, 1024), 0.25, device="npu")
+    out = torch.empty((tokens, 1, 1024), dtype=torch.bfloat16, device="npu")
+    prepared = PreparedTQBMM(x, weight, sx, sw, out=out, block_shape=(64, 64, 128), num_stages=2)
+    assert prepared.output.data_ptr() == out.data_ptr()
+    for factor in (1.0, 0.5):
+        out.fill_(float("nan"))
+        sx.fill_(0.125 * factor)
+        expected = qbmm_reference(x, weight, sx, sw, torch.bfloat16)
+        torch.testing.assert_close(prepared(), expected, rtol=0, atol=0, equal_nan=False)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        actual = prepared()
+    x.copy_(torch.randint(-8, 9, x.shape, dtype=torch.int8, device="npu"))
+    sx.fill_(0.25)
+    graph.replay()
+    torch.npu.synchronize()
+    torch.testing.assert_close(actual, qbmm_reference(x, weight, sx, sw, torch.bfloat16), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_safe_output_and_prepared_tails(output_dtype):
+    x = torch.randint(-8, 9, (17, 2, 65), dtype=torch.int8, device="npu")
+    weight = torch.randint(-8, 9, (2, 33, 65), dtype=torch.int8, device="npu").transpose(1, 2)
+    sx = torch.full((17, 2), 0.125, device="npu")
+    sw = torch.full((2, 33), 0.25, device="npu")
+    out = torch.empty((17, 2, 33), dtype=output_dtype, device="npu")
+    # Independent exact reference also covers FP32 output, which need not be
+    # supported by the native quantized-matmul reference API on every CANN.
+    golden = torch.bmm(x.cpu().double().transpose(0, 1), weight.cpu().double()).transpose(0, 1)
+    expected = ((golden * 0.25) * 0.125).to(output_dtype).npu()
+    assert transpose_quant_batch_matmul(x, weight, sx, sw, output_dtype=output_dtype, out=out) is out
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    prepared = PreparedTQBMM(x, weight, sx, sw, out=out, output_dtype=output_dtype)
+    out.fill_(float("nan"))
+    torch.testing.assert_close(prepared(), expected, rtol=0, atol=0, equal_nan=False)
+
+
+def test_safe_output_rejects_real_alias():
+    storage = torch.empty(32768, dtype=torch.uint8, device="npu")
+    x = storage[:64].view(torch.int8).reshape(1, 1, 64)
+    weight = torch.ones((1, 64, 32), dtype=torch.int8, device="npu")
+    sx = torch.ones(1, 1, device="npu")
+    sw = torch.ones(1, 32, device="npu")
+    out = storage[:64].view(torch.bfloat16).reshape(1, 1, 32)
+    with pytest.raises(ValueError, match="overlap"):
+        transpose_quant_batch_matmul(x, weight, sx, sw, out=out)
+    with pytest.raises(ValueError, match="overlap"):
+        PreparedTQBMM(x, weight, sx, sw, out=out)
+
+
+def test_prepared_zero_tokens():
+    x = torch.empty((0, 2, 64), dtype=torch.int8, device="npu")
+    weight = torch.ones((2, 64, 32), dtype=torch.int8, device="npu")
+    sx = torch.empty((0, 2), device="npu")
+    sw = torch.ones((2, 32), device="npu")
+    prepared = PreparedTQBMM(x, weight, sx, sw)
+    assert prepared().shape == (0, 2, 32)
+
+
+def test_independent_prepared_bindings_on_two_streams():
+    weight = torch.ones((1, 64, 32), dtype=torch.int8, device="npu")
+    sw = torch.full((1, 32), 0.25, device="npu")
+    x1 = torch.ones((16, 1, 64), dtype=torch.int8, device="npu")
+    x2 = torch.full_like(x1, 2)
+    sx1 = torch.full((16, 1), 0.125, device="npu")
+    sx2 = sx1.clone()
+    first = PreparedTQBMM(x1, weight, sx1, sw)
+    second = PreparedTQBMM(x2, weight, sx2, sw)
+    first()  # Compile before testing independent stream submission.
+    torch.npu.synchronize()
+    stream1, stream2 = torch.npu.Stream(), torch.npu.Stream()
+    with torch.npu.stream(stream1):
+        out1 = first()
+    with torch.npu.stream(stream2):
+        out2 = second()
+    torch.npu.synchronize()
+    assert out1.data_ptr() != out2.data_ptr()
+    torch.testing.assert_close(out1.cpu(), torch.full((16, 1, 32), 2.0, dtype=torch.bfloat16), rtol=0, atol=0)
+    torch.testing.assert_close(out2.cpu(), torch.full((16, 1, 32), 4.0, dtype=torch.bfloat16), rtol=0, atol=0)

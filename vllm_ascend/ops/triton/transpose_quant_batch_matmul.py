@@ -6,6 +6,8 @@ Inputs are already quantized. Dynamic activation quantization is deliberately
 outside this operator. All operands must use ordinary ND storage, not NZ.
 """
 
+from dataclasses import dataclass
+
 import torch
 import torch_npu
 from vllm.triton_utils import tl, triton
@@ -119,6 +121,44 @@ def _validate_num_stages(num_stages):
         raise ValueError("num_stages must be 1 (disable auto multi-buffering) or 2 (automatic mode)")
 
 
+def _resolve_launch_options(tokens, block_shape, num_stages, transpose_weight_tile):
+    _validate_num_stages(num_stages)
+    if type(transpose_weight_tile) is not bool:
+        raise TypeError("transpose_weight_tile must be a bool")
+    if block_shape is None:
+        block_m = 16 if tokens <= 16 else 32 if tokens <= 32 else 64
+        block_shape = (block_m, DEFAULT_BLOCK_N, DEFAULT_BLOCK_K)
+    if len(block_shape) != 3 or any(
+        not isinstance(size, int) or size < 16 or size & (size - 1) for size in block_shape
+    ):
+        raise ValueError("block_shape must contain three powers of two, each >= 16")
+    if block_shape[2] < 32:
+        raise ValueError("INT8 dot requires block K >= 32")
+    return tuple(block_shape)
+
+
+def _validate_output(out, inputs, shape, output_dtype):
+    if out.shape != shape or out.dtype != output_dtype or out.device != inputs[0].device:
+        raise ValueError("TQBMM out must match output shape, dtype and device")
+    if out.requires_grad:
+        raise ValueError("TQBMM out must not require gradients")
+    if not out.is_contiguous():
+        raise ValueError("TQBMM out must be contiguous")
+    if torch_npu.get_npu_format(out) not in (0, 2):
+        raise ValueError("TQBMM out requires ND storage")
+    if out.numel() == 0:
+        return
+    # Use allocation ranges, not tensor.data_ptr(): views can start at different
+    # offsets in the same allocation. This conservatively rejects even disjoint
+    # views of an input allocation. Metadata only; no device-to-host value copy.
+    storage = out.untyped_storage()
+    first, last = storage.data_ptr(), storage.data_ptr() + storage.nbytes()
+    for tensor in inputs:
+        source = tensor.untyped_storage()
+        if first < source.data_ptr() + source.nbytes() and source.data_ptr() < last:
+            raise ValueError("TQBMM out must not overlap any input allocation")
+
+
 def transpose_quant_batch_matmul(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -129,6 +169,7 @@ def transpose_quant_batch_matmul(
     block_shape: tuple[int, int, int] | None = None,
     num_stages: int = 1,
     transpose_weight_tile: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """INT8 matmul with per-token-per-group / per-group-per-channel scales.
 
@@ -143,26 +184,21 @@ def transpose_quant_batch_matmul(
     catch-and-retry path are added.
     ``transpose_weight_tile`` enables an unverified physical [N,K] tile load
     followed by a tile transpose. The validated direct load remains the default.
+    ``out`` optionally supplies contiguous, non-aliasing ND output storage.
+    This safe entry point still validates every call. For explicitly fixed
+    buffers, use ``PreparedTQBMM`` to validate and bind outside the hot loop.
     """
     _validate_inputs(x, weight, x_scale, weight_scale, output_dtype)
-    _validate_num_stages(num_stages)
-    if type(transpose_weight_tile) is not bool:
-        raise TypeError("transpose_weight_tile must be a bool")
     if x.device.type != "npu":
         raise ValueError("TQBMM is an Ascend NPU kernel; run it on A3")
     tokens, groups, inner = x.shape
     columns = weight.shape[-1]
-    if block_shape is None:
-        block_m = 16 if tokens <= 16 else 32 if tokens <= 32 else 64
-        block_shape = (block_m, DEFAULT_BLOCK_N, DEFAULT_BLOCK_K)
-    if len(block_shape) != 3 or any(
-        not isinstance(size, int) or size < 16 or size & (size - 1) for size in block_shape
-    ):
-        raise ValueError("block_shape must contain three powers of two, each >= 16")
-    block_m, block_n, block_k = block_shape
-    if block_k < 32:
-        raise ValueError("INT8 dot requires block K >= 32")
-    output = torch.empty((tokens, groups, columns), dtype=output_dtype, device=x.device)
+    block_m, block_n, block_k = _resolve_launch_options(tokens, block_shape, num_stages, transpose_weight_tile)
+    if out is None:
+        output = torch.empty((tokens, groups, columns), dtype=output_dtype, device=x.device)
+    else:
+        _validate_output(out, (x, weight, x_scale, weight_scale), (tokens, groups, columns), output_dtype)
+        output = out
     if tokens == 0:
         return output
     if any(torch_npu.get_npu_format(tensor) not in (0, 2) for tensor in (x, weight, x_scale, weight_scale)):
@@ -192,8 +228,106 @@ def transpose_quant_batch_matmul(
     return output
 
 
+@dataclass(frozen=True, init=False, eq=False, repr=False)
+class PreparedTQBMM:
+    """Explicit fixed-buffer inference binding; no process-global cache.
+
+    Construction performs full validation and optionally allocates output.
+    Calls use the same JIT kernel with cached shape/stride/grid/configuration,
+    without allocation or repeated checks. Strong references to detached views
+    keep all allocations alive and isolate ordinary tensor metadata rebinding.
+    In-place VALUE updates (e.g. ``x.copy_(new_x)``) are visible on later calls.
+
+    Contract: storage, layouts and shapes must remain fixed for this binding's
+    lifetime. Do not resize/free/reformat underlying storage, mutate the bound
+    views' metadata, or replace weight allocations; construct a new binding
+    instead. This is NOT a dynamic-tensor replacement for the safe entry point.
+    One output is reused: consume it before calling again, serialize input
+    updates/launch/consumption on a stream, and use separate bindings for
+    concurrent in-flight outputs. ACL graph replay follows the same contract.
+    """
+
+    output: torch.Tensor
+    _arguments: tuple
+    _grid: tuple
+    _block_shape: tuple
+    _num_stages: int
+    _transpose_weight_tile: bool
+    _empty: bool
+
+    def __init__(
+        self,
+        x,
+        weight,
+        x_scale,
+        weight_scale,
+        *,
+        output_dtype=torch.bfloat16,
+        block_shape=None,
+        num_stages=1,
+        transpose_weight_tile=False,
+        out=None,
+    ):
+        _validate_inputs(x, weight, x_scale, weight_scale, output_dtype)
+        if x.device.type != "npu":
+            raise ValueError("TQBMM is an Ascend NPU kernel; run it on A3")
+        tokens, groups, inner = x.shape
+        columns = weight.shape[-1]
+        block_shape = _resolve_launch_options(tokens, block_shape, num_stages, transpose_weight_tile)
+        inputs = (x, weight, x_scale, weight_scale)
+        if any(torch_npu.get_npu_format(tensor) not in (0, 2) for tensor in inputs):
+            raise ValueError("TQBMM requires ND storage; NZ is not supported")
+        if out is None:
+            out = torch.empty((tokens, groups, columns), dtype=output_dtype, device=x.device)
+        _validate_output(out, inputs, (tokens, groups, columns), output_dtype)
+        # Views share values/storage but do not share tensor metadata with the
+        # caller's objects. No quantization, layout conversion or value copy.
+        bound = tuple(tensor.detach() for tensor in (*inputs, out))
+        object.__setattr__(self, "output", bound[-1])
+        object.__setattr__(
+            self,
+            "_arguments",
+            (
+                *bound,
+                tokens,
+                groups,
+                inner,
+                columns,
+                *x.stride(),
+                *weight.stride(),
+                *x_scale.stride(),
+                *weight_scale.stride(),
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_grid",
+            (
+                triton.cdiv(tokens, block_shape[0]) * triton.cdiv(columns, block_shape[1]),
+                groups,
+            ),
+        )
+        object.__setattr__(self, "_block_shape", block_shape)
+        object.__setattr__(self, "_num_stages", num_stages)
+        object.__setattr__(self, "_transpose_weight_tile", transpose_weight_tile)
+        object.__setattr__(self, "_empty", tokens == 0)
+
+    def __call__(self):
+        if not self._empty:
+            _transpose_quant_batch_matmul_kernel[self._grid](
+                *self._arguments,
+                BLOCK_M=self._block_shape[0],
+                BLOCK_N=self._block_shape[1],
+                BLOCK_K=self._block_shape[2],
+                GROUP_SIZE_M=DEFAULT_GROUP_SIZE_M,
+                TRANSPOSE_WEIGHT_TILE=self._transpose_weight_tile,
+                num_stages=self._num_stages,
+            )
+        return self.output
+
+
 def dynamic_quant_grouped_wo_a(
-    activations, weight, weight_scale, *, block_shape=None, num_stages=1, transpose_weight_tile=False
+    activations, weight, weight_scale, *, block_shape=None, num_stages=1, transpose_weight_tile=False, out=None
 ):
     """Keep CANN dynamic quantization, then run one fused TQBMM for all groups."""
     if activations.ndim != 3 or activations.dtype not in (torch.bfloat16, torch.float16):
@@ -219,4 +353,5 @@ def dynamic_quant_grouped_wo_a(
         block_shape=block_shape,
         num_stages=num_stages,
         transpose_weight_tile=transpose_weight_tile,
+        out=out,
     )

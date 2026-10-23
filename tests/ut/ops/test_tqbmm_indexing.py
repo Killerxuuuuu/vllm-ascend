@@ -230,6 +230,7 @@ def test_launch_uses_small_tiles_and_forwards_num_stages(num_stages, transpose_w
         "DEFAULT_BLOCK_K": 32,
         "DEFAULT_GROUP_SIZE_M": 4,
     }
+    load_function("_resolve_launch_options", namespace)
     operator = load_function("transpose_quant_batch_matmul", namespace)
     kwargs = {} if num_stages is None else {"num_stages": num_stages}
     if transpose_weight_tile is not None:
