@@ -22,6 +22,8 @@ from statistics import median
 REPO_ROOT = Path(__file__).resolve().parent
 CASES = ("A_full", "B_unchecked_alloc", "C_unchecked_reuse", "D_graph_full")
 NATIVE_CASES = ("R_qbmm_eager", "R_qbmm_graph")
+VALIDATION_CASES = ("V_control", "V_input_metadata", "V_option_metadata", "V_format", "V_all")
+ADDBACK_CHECKS = ("empty_call_control", "input_metadata", "option_metadata", "format_all_four", "all_validation")
 GRAPH_CASES = ("D_graph_full", "R_qbmm_graph")
 TIMING_FIELDS = ("host_submit_us", "stream_us", "wall_us")
 GRAPH_WARMUP_REPLAYS = 3
@@ -47,6 +49,9 @@ def parse_args(argv=None):
     parser.add_argument("--check-breakdown", action="store_true", help="Separately time validation/format queries")
     parser.add_argument("--check-iterations", type=int, default=2048)
     parser.add_argument("--include-qbmm", action="store_true", help="Include same-run native composition Eager/Graph")
+    parser.add_argument(
+        "--validation-addback", action="store_true", help="Add checks back to the identical B launch path"
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if (
@@ -211,6 +216,20 @@ def measure_host(function, npu, iterations):
     return elapsed * 1e6 / iterations
 
 
+def check_then_launch(check, launch):
+    # All V variants share this exact wrapper and the exact B allocation/JIT
+    # path. Include a no-op control to expose the extra wrapper's own overhead.
+    check()
+    return launch()
+
+
+def validation_addback_functions(launch, checks):
+    return {
+        name: partial(check_then_launch, checks[check_name], launch)
+        for name, check_name in zip(VALIDATION_CASES, ADDBACK_CHECKS)
+    }
+
+
 def capture_graph(function, npu, batch_size):
     npu.synchronize()
     graph = npu.NPUGraph()
@@ -339,6 +358,21 @@ def run_device(args, report, output):
                 return qbmm_reference(x, weight, sx, sw, torch.bfloat16)
 
             functions = dict(zip(CASES[:3], (full, unchecked_alloc, unchecked_reuse)))
+            checks = {}
+            if args.check_breakdown or args.validation_addback:
+                checks = validation_functions(
+                    torch,
+                    torch_npu,
+                    _validate_inputs,
+                    _validate_num_stages,
+                    x,
+                    weight,
+                    sx,
+                    sw,
+                    args,
+                )
+            if args.validation_addback:
+                functions.update(validation_addback_functions(unchecked_alloc, checks))
             if args.include_qbmm:
                 functions[NATIVE_CASES[0]] = reference
             expected = qbmm_reference(x, weight, sx, sw, torch.bfloat16)
@@ -378,20 +412,12 @@ def run_device(args, report, output):
                 torch.testing.assert_close(captured_output, expected, rtol=0, atol=0, equal_nan=False)
                 functions[name] = graph.replay
 
-            names = CASES + (NATIVE_CASES if args.include_qbmm else ())
-            checks = {}
+            names = (
+                CASES
+                + (NATIVE_CASES if args.include_qbmm else ())
+                + (VALIDATION_CASES if args.validation_addback else ())
+            )
             if args.check_breakdown:
-                checks = validation_functions(
-                    torch,
-                    torch_npu,
-                    _validate_inputs,
-                    _validate_num_stages,
-                    x,
-                    weight,
-                    sx,
-                    sw,
-                    args,
-                )
                 for function in checks.values():
                     for _ in range(max(1, args.warmup)):
                         function()
@@ -403,7 +429,7 @@ def run_device(args, report, output):
                 "changed_input_checks": "passed for all selected cases",
                 "samples": {name: [] for name in names},
             }
-            if checks:
+            if args.check_breakdown:
                 result["check_samples_us"] = {name: [] for name in checks}
             report["results"].append(result)
             print(f"T={tokens}: strict {','.join(names)} and changed-input checks passed", flush=True)
@@ -417,11 +443,11 @@ def run_device(args, report, output):
                     )
                     result["samples"][name].append(sample)
                 result["median_us"] = summarize(result["samples"])
-                for name in case_order(repeat, tuple(checks)) if checks else ():
+                for name in case_order(repeat, tuple(checks)) if args.check_breakdown else ():
                     result["check_samples_us"][name].append(
                         measure_host(checks[name], torch.npu, args.check_iterations)
                     )
-                if checks:
+                if args.check_breakdown:
                     result["check_median_us"] = {
                         name: median(samples) for name, samples in result["check_samples_us"].items()
                     }
@@ -463,6 +489,23 @@ def main(argv=None):
                 "R_qbmm_eager": "Same-run native composition, including per-call transpose/contiguous and stack",
                 "R_qbmm_graph": "Graph replay of the same native composition; no outside prepacking",
             }
+        )
+    if args.validation_addback:
+        report["cases"].update(
+            {
+                "V_control": "No-op check then the identical B allocation/JIT path; wrapper control",
+                "V_input_metadata": "Actual input validator then the identical B allocation/JIT path",
+                "V_option_metadata": "Option validator then the identical B allocation/JIT path",
+                "V_format": "Four-tensor ND format checks then the identical B allocation/JIT path",
+                "V_all": "All validation checks then the identical B allocation/JIT path",
+            }
+        )
+        report["addback_note"] = (
+            "All V cases use the same check_then_launch wrapper and unchanged B allocation/launch. "
+            "Compare V_* with V_control, and V_control with B to expose instrumentation overhead. "
+            "V_all with A estimates remaining wrapper/order differences, not a proved runtime defect. "
+            "V format checks precede allocation; the public wrapper checks format after allocation. "
+            "All V cases pass the same strict original/changed-input gates before timing."
         )
     if args.check_breakdown:
         report["check_note"] = (

@@ -329,3 +329,44 @@ def test_check_csv_does_not_mix_host_microbench_with_device_timings(tmp_path):
     }
     assert "stream_us" not in rows[0]
     assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("name,check_name", tuple(zip(diagnostic.VALIDATION_CASES, diagnostic.ADDBACK_CHECKS)))
+def test_validation_addback_shares_launch_and_preserves_check_order(name, check_name):
+    calls = []
+    checks = {key: Mock(side_effect=lambda key=key: calls.append(key)) for key in diagnostic.ADDBACK_CHECKS}
+    output = object()
+    launch = Mock(side_effect=lambda: (calls.append("launch"), output)[1])
+    functions = diagnostic.validation_addback_functions(launch, checks)
+    assert tuple(functions) == diagnostic.VALIDATION_CASES
+    assert functions[name]() is output
+    assert calls == [check_name, "launch"]
+    launch.assert_called_once_with()
+    for key, check in checks.items():
+        assert check.call_count == int(key == check_name)
+
+
+def test_addback_failure_never_launches_kernel():
+    checks = {key: Mock() for key in diagnostic.ADDBACK_CHECKS}
+    checks["format_all_four"].side_effect = ValueError("bad format")
+    launch = Mock()
+    with pytest.raises(ValueError, match="bad format"):
+        diagnostic.validation_addback_functions(launch, checks)["V_format"]()
+    launch.assert_not_called()
+
+
+@pytest.mark.parametrize("breakdown", [False, True])
+def test_addback_cli_is_opt_in_and_compatible_with_other_modes(breakdown, capsys):
+    options = ["--quant-model", "unused", "--validation-addback", "--include-qbmm", "--dry-run"]
+    if breakdown:
+        options.append("--check-breakdown")
+    assert diagnostic.main(options) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert tuple(report["cases"]) == diagnostic.CASES + diagnostic.NATIVE_CASES + diagnostic.VALIDATION_CASES
+    assert "addback_note" in report
+    assert report["settings"]["check_breakdown"] is breakdown
+    assert report["settings"]["validation_addback"]
+    for name in diagnostic.VALIDATION_CASES:
+        assert name not in diagnostic.GRAPH_CASES
+    args = diagnostic.parse_args(["--quant-model", "unused"])
+    assert not args.validation_addback

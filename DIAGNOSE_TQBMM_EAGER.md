@@ -116,6 +116,45 @@ Graph 测量的是一批调用的摊销结果，不是单请求延迟。
 本脚本不自动作因果判断，不把动态量化或整网收益混入诊断结论。
 建议保持已验证的数值路径不变，拿到这组结果后再决定具体修改位置。
 
+## 同一路径逐项加回校验
+
+当独立校验微测试不能解释 A−B 的全部差距时，使用新增的 `--validation-addback`。
+先同步更新后的 `diagnose_tqbmm_eager.py`；本轮先测 T=1、512 两端，不改生产接口或 kernel。
+
+```bash
+cd /home/w00601343/vllm-ascend
+python -u diagnose_tqbmm_eager.py \
+  --quant-model /home/w00601343/outputs/dsv4-0731-w8a8-int8-with-wo-20261019-081956 \
+  --tokens 1 512 \
+  --block-shape 64 64 128 --num-stages 2 \
+  --warmup 20 --iterations 256 --repeats 11 \
+  --validation-addback \
+  --check-breakdown --check-iterations 2048 \
+  --include-qbmm \
+  --output /home/w00601343/tqbmm-addback-$(date +%Y%m%d-%H%M%S)
+```
+
+除原来的 A/B/C/D 和两个原生对照外，还会增加五条 Eager 路径：
+
+| 标记 | 在同一个 B 分配/启动路径前执行的检查 |
+| --- | --- |
+| `V_control` | 空函数，控制新增包装自身的开销 |
+| `V_input_metadata` | 现有输入 dtype/shape/device 校验 |
+| `V_option_metadata` | stages、tile、transpose 和 NPU 类型检查 |
+| `V_format` | 四个张量的格式查询/检查 |
+| `V_all` | 依次执行上述全部检查 |
+
+五条 V 路径使用同一个 `check_then_launch` 包装，均调用完全相同的 B 函数。
+不复用输出、不缓存启动元数据，也不改 stride、tile、数值或内核。
+所有新增路径都参与原输入及变更输入的严格数值门控，失败不会继续计时。
+合计 11 条路径，11 轮轮换让每条路径在每个测量顺序位置各出现一次。
+
+先比较 `V_control` 与 B，确认额外包装的影响，再比较各 V 路径与 `V_control`。
+最后比较 `V_all` 与 A，判断剩余差距是否仍存在。
+注意 V 的检查均在分配输出之前，而原接口的格式检查在分配之后，仍有顺序与代码布局差异；
+不能仅凭剩余差值断言 Triton 运行时有问题，也不能将独立流水线时间机械相加。
+仍返回 `result.json`、`timings.csv`、`check_timings.csv` 三个文件；错误时另附 `error.log`。
+
 ## CPU 控制逻辑测试
 
 ```bash
