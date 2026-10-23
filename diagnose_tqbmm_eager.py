@@ -15,11 +15,14 @@ import sys
 import time
 import traceback
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from statistics import median
 
 REPO_ROOT = Path(__file__).resolve().parent
 CASES = ("A_full", "B_unchecked_alloc", "C_unchecked_reuse", "D_graph_full")
+NATIVE_CASES = ("R_qbmm_eager", "R_qbmm_graph")
+GRAPH_CASES = ("D_graph_full", "R_qbmm_graph")
 TIMING_FIELDS = ("host_submit_us", "stream_us", "wall_us")
 GRAPH_WARMUP_REPLAYS = 3
 
@@ -41,9 +44,15 @@ def parse_args(argv=None):
     parser.add_argument("--iterations", type=int, default=256)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--graph-batch-size", type=int, default=16)
+    parser.add_argument("--check-breakdown", action="store_true", help="Separately time validation/format queries")
+    parser.add_argument("--check-iterations", type=int, default=2048)
+    parser.add_argument("--include-qbmm", action="store_true", help="Include same-run native composition Eager/Graph")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    if min(*args.tokens, args.tp_size, args.iterations, args.repeats, args.graph_batch_size) <= 0:
+    if (
+        min(*args.tokens, args.tp_size, args.iterations, args.repeats, args.graph_batch_size, args.check_iterations)
+        <= 0
+    ):
         parser.error("tokens/TP/iterations/repeats/graph-batch-size must be positive")
     if args.warmup < 0 or args.layer < 0 or not 0 <= args.tp_rank < args.tp_size:
         parser.error("warmup/layer must be nonnegative; tp-rank must be in [0,tp-size)")
@@ -129,10 +138,89 @@ def summarize(samples):
     }
 
 
-def case_order(repeat):
+def case_order(repeat, cases=CASES):
     # Deterministic rotation reduces fixed case-order bias across repeats.
-    offset = repeat % len(CASES)
-    return CASES[offset:] + CASES[:offset]
+    offset = repeat % len(cases)
+    return cases[offset:] + cases[:offset]
+
+
+def check_format(get_format, tensor):
+    if get_format(tensor) not in (0, 2):
+        raise ValueError("Diagnostic inputs must use ordinary ND storage")
+
+
+def validation_functions(torch_module, torch_npu, validate_inputs, validate_stages, x, weight, sx, sw, args):
+    """Call the actual input validator, and mirror remaining option/format checks.
+
+    These do not launch matmul, allocate output, or alter tensors. Query costs
+    are measured rather than assuming get_npu_format causes synchronization.
+    """
+
+    def empty_call():
+        pass
+
+    def input_metadata():
+        validate_inputs(x, weight, sx, sw, torch_module.bfloat16)
+
+    def option_metadata():
+        validate_stages(args.num_stages)
+        if type(args.transpose_weight_tile) is not bool:
+            raise TypeError("transpose_weight_tile must be bool")
+        if x.device.type != "npu":
+            raise ValueError("Requires NPU tensors")
+        block_shape = tuple(args.block_shape)
+        if (
+            len(block_shape) != 3
+            or any(not isinstance(size, int) or size < 16 or size & (size - 1) for size in block_shape)
+            or block_shape[2] < 32
+        ):
+            raise ValueError("Invalid block shape")
+
+    def format_all():
+        # Same short-circuit expression and tensor order as the public wrapper.
+        if any(torch_npu.get_npu_format(tensor) not in (0, 2) for tensor in (x, weight, sx, sw)):
+            raise ValueError("Diagnostic inputs must use ordinary ND storage")
+
+    def all_validation():
+        input_metadata()
+        option_metadata()
+        format_all()
+
+    return {
+        "empty_call_control": empty_call,
+        "input_metadata": input_metadata,
+        "option_metadata": option_metadata,
+        "format_all_four": format_all,
+        "format_x": partial(check_format, torch_npu.get_npu_format, x),
+        "format_weight": partial(check_format, torch_npu.get_npu_format, weight),
+        "format_x_scale": partial(check_format, torch_npu.get_npu_format, sx),
+        "format_weight_scale": partial(check_format, torch_npu.get_npu_format, sw),
+        "all_validation": all_validation,
+    }
+
+
+def measure_host(function, npu, iterations):
+    # No per-call timers, events or synchronization; include any blocking
+    # inside the query itself, but exclude the boundary synchronization.
+    npu.synchronize()
+    before = time.perf_counter()
+    for _ in range(iterations):
+        function()
+    elapsed = time.perf_counter() - before
+    npu.synchronize()
+    return elapsed * 1e6 / iterations
+
+
+def capture_graph(function, npu, batch_size):
+    npu.synchronize()
+    graph = npu.NPUGraph()
+    with npu.graph(graph):
+        for _ in range(batch_size):
+            output = function()
+    for _ in range(GRAPH_WARMUP_REPLAYS):
+        graph.replay()
+    npu.synchronize()
+    return graph, output
 
 
 def save_report(output, report):
@@ -151,6 +239,26 @@ def save_report(output, report):
     temporary.write_text(text.getvalue(), encoding="utf-8")
     temporary.chmod(0o644)
     temporary.replace(output / "timings.csv")
+    if report.get("settings", {}).get("check_breakdown"):
+        text = io.StringIO(newline="")
+        writer = csv.DictWriter(text, fieldnames=["T", "check", "repeat", "iterations", "host_call_us"])
+        writer.writeheader()
+        for result in report["results"]:
+            for name, samples in result.get("check_samples_us", {}).items():
+                for repeat, sample in enumerate(samples):
+                    writer.writerow(
+                        {
+                            "T": result["shape_T_G_K_N"][0],
+                            "check": name,
+                            "repeat": repeat,
+                            "iterations": report["settings"]["check_iterations"],
+                            "host_call_us": sample,
+                        }
+                    )
+        temporary = output / "check_timings.csv.tmp"
+        temporary.write_text(text.getvalue(), encoding="utf-8")
+        temporary.chmod(0o644)
+        temporary.replace(output / "check_timings.csv")
 
 
 def run_device(args, report, output):
@@ -164,6 +272,8 @@ def run_device(args, report, output):
     from vllm_ascend.ops.triton.transpose_quant_batch_matmul import (
         DEFAULT_GROUP_SIZE_M,
         _transpose_quant_batch_matmul_kernel,
+        _validate_inputs,
+        _validate_num_stages,
         transpose_quant_batch_matmul,
     )
     from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
@@ -225,7 +335,12 @@ def run_device(args, report, output):
                     output=preallocated,
                 )
 
+            def reference(x=x, sx=sx):
+                return qbmm_reference(x, weight, sx, sw, torch.bfloat16)
+
             functions = dict(zip(CASES[:3], (full, unchecked_alloc, unchecked_reuse)))
+            if args.include_qbmm:
+                functions[NATIVE_CASES[0]] = reference
             expected = qbmm_reference(x, weight, sx, sw, torch.bfloat16)
             # Validate with the public wrapper first. B/C are diagnostic only.
             for function in functions.values():
@@ -234,14 +349,13 @@ def run_device(args, report, output):
                 for _ in range(args.warmup):
                     function()
             torch.npu.synchronize()
-            graph = torch.npu.NPUGraph()
-            with torch.npu.graph(graph):
-                for _ in range(args.graph_batch_size):
-                    captured_output = full()
-            for _ in range(GRAPH_WARMUP_REPLAYS):
-                graph.replay()
-            torch.npu.synchronize()
-            torch.testing.assert_close(captured_output, expected, rtol=0, atol=0, equal_nan=False)
+            graph_sources = {CASES[3]: full}
+            if args.include_qbmm:
+                graph_sources[NATIVE_CASES[1]] = reference
+            graphs = {}
+            for name, function in graph_sources.items():
+                graphs[name] = capture_graph(function, torch.npu, args.graph_batch_size)
+                torch.testing.assert_close(graphs[name][1], expected, rtol=0, atol=0, equal_nan=False)
 
             # Replay must consume current buffers, not a baked-in input.
             original_x, original_sx = x.clone(), sx.clone()
@@ -252,37 +366,73 @@ def run_device(args, report, output):
             for function in functions.values():
                 preallocated.fill_(float("nan"))
                 torch.testing.assert_close(function(), changed_expected, rtol=0, atol=0, equal_nan=False)
-            graph.replay()
-            torch.npu.synchronize()
-            torch.testing.assert_close(captured_output, changed_expected, rtol=0, atol=0, equal_nan=False)
+            for graph, captured_output in graphs.values():
+                graph.replay()
+                torch.npu.synchronize()
+                torch.testing.assert_close(captured_output, changed_expected, rtol=0, atol=0, equal_nan=False)
             x.copy_(original_x)
             sx.copy_(original_sx)
-            graph.replay()
-            torch.npu.synchronize()
-            torch.testing.assert_close(captured_output, expected, rtol=0, atol=0, equal_nan=False)
-            functions[CASES[3]] = graph.replay
+            for name, (graph, captured_output) in graphs.items():
+                graph.replay()
+                torch.npu.synchronize()
+                torch.testing.assert_close(captured_output, expected, rtol=0, atol=0, equal_nan=False)
+                functions[name] = graph.replay
+
+            names = CASES + (NATIVE_CASES if args.include_qbmm else ())
+            checks = {}
+            if args.check_breakdown:
+                checks = validation_functions(
+                    torch,
+                    torch_npu,
+                    _validate_inputs,
+                    _validate_num_stages,
+                    x,
+                    weight,
+                    sx,
+                    sw,
+                    args,
+                )
+                for function in checks.values():
+                    for _ in range(max(1, args.warmup)):
+                        function()
 
             result = {
                 "shape_T_G_K_N": [tokens, groups, inner, columns],
                 "weight_stride": list(weight.stride()),
                 "strict_correctness": True,
-                "changed_input_checks": "passed for A/B/C/D",
-                "samples": {name: [] for name in CASES},
+                "changed_input_checks": "passed for all selected cases",
+                "samples": {name: [] for name in names},
             }
+            if checks:
+                result["check_samples_us"] = {name: [] for name in checks}
             report["results"].append(result)
-            print(f"T={tokens}: strict A/B/C/D and changed-input checks passed", flush=True)
+            print(f"T={tokens}: strict {','.join(names)} and changed-input checks passed", flush=True)
             for repeat in range(args.repeats):
-                for name in case_order(repeat):
+                for name in case_order(repeat, names):
                     sample = measure(
                         functions[name],
                         torch.npu,
                         args.iterations,
-                        args.graph_batch_size if name == CASES[3] else 1,
+                        args.graph_batch_size if name in GRAPH_CASES else 1,
                     )
                     result["samples"][name].append(sample)
                 result["median_us"] = summarize(result["samples"])
+                for name in case_order(repeat, tuple(checks)) if checks else ():
+                    result["check_samples_us"][name].append(
+                        measure_host(checks[name], torch.npu, args.check_iterations)
+                    )
+                if checks:
+                    result["check_median_us"] = {
+                        name: median(samples) for name, samples in result["check_samples_us"].items()
+                    }
                 save_report(output, report)
-            print(json.dumps({"T": tokens, "median_us": result["median_us"]}, indent=2), flush=True)
+            print(
+                json.dumps(
+                    {"T": tokens, "median_us": result["median_us"], "check_median_us": result.get("check_median_us")},
+                    indent=2,
+                ),
+                flush=True,
+            )
 
 
 def main(argv=None):
@@ -307,6 +457,19 @@ def main(argv=None):
         "A-B also includes wrapper implementation differences, not exact check-only cost. "
         "Graph is amortized over calls per replay; no profiler is enabled.",
     }
+    if args.include_qbmm:
+        report["cases"].update(
+            {
+                "R_qbmm_eager": "Same-run native composition, including per-call transpose/contiguous and stack",
+                "R_qbmm_graph": "Graph replay of the same native composition; no outside prepacking",
+            }
+        )
+    if args.check_breakdown:
+        report["check_note"] = (
+            "Check-only CPU wall-time microbenchmarks use the same fixed NPU tensors, no matmul or output allocation. "
+            "empty_call_control is reported, not subtracted. Query costs may include runtime blocking. "
+            "Isolated costs need not sum exactly to the full-wrapper difference."
+        )
     if args.dry_run:
         print(json.dumps(report, indent=2))
         return 0

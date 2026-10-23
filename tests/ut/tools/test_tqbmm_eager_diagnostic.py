@@ -39,6 +39,7 @@ def test_defaults():
         ["--block-shape", "24", "32", "64"],
         ["--block-shape", "16", "32", "16"],
         ["--num-stages", "3"],
+        ["--check-iterations", "0"],
     ],
 )
 def test_invalid_options(options):
@@ -202,3 +203,129 @@ def test_main_preserves_partial_results(tmp_path, status):
     with patch.object(diagnostic, "run_device") as runner, pytest.raises(FileExistsError):
         diagnostic.main(["--quant-model", str(model), "--output", str(output)])
     runner.assert_not_called()
+
+
+def make_check_functions(format_code=2):
+    args = diagnostic.parse_args(["--quant-model", "unused"])
+    x = SimpleNamespace(device=SimpleNamespace(type="npu"))
+    weight, sx, sw = object(), object(), object()
+    validate_inputs, validate_stages = Mock(), Mock()
+    torch_module = SimpleNamespace(bfloat16="bf16")
+    torch_npu = SimpleNamespace(get_npu_format=Mock(return_value=format_code))
+    functions = diagnostic.validation_functions(
+        torch_module,
+        torch_npu,
+        validate_inputs,
+        validate_stages,
+        x,
+        weight,
+        sx,
+        sw,
+        args,
+    )
+    return functions, torch_npu, validate_inputs, validate_stages, (x, weight, sx, sw), args
+
+
+def test_check_breakdown_calls_real_metadata_validator_and_queries_in_order():
+    functions, npu, inputs, stages, tensors, args = make_check_functions()
+    functions["empty_call_control"]()
+    inputs.assert_not_called()
+    npu.get_npu_format.assert_not_called()
+    functions["input_metadata"]()
+    inputs.assert_called_once_with(*tensors, "bf16")
+    functions["option_metadata"]()
+    stages.assert_called_once_with(args.num_stages)
+    functions["format_all_four"]()
+    assert [call.args[0] for call in npu.get_npu_format.call_args_list] == list(tensors)
+    npu.get_npu_format.reset_mock()
+    for name in ("format_x", "format_weight", "format_x_scale", "format_weight_scale"):
+        functions[name]()
+    assert [call.args[0] for call in npu.get_npu_format.call_args_list] == list(tensors)
+
+
+def test_combined_validation_and_invalid_format():
+    functions, npu, inputs, stages, tensors, _ = make_check_functions()
+    functions["all_validation"]()
+    assert inputs.call_count == stages.call_count == 1
+    assert npu.get_npu_format.call_count == 4
+    npu.get_npu_format.return_value = 29
+    npu.get_npu_format.reset_mock()
+    with pytest.raises(ValueError, match="ND storage"):
+        functions["format_all_four"]()
+    npu.get_npu_format.assert_called_once_with(tensors[0])
+    with pytest.raises(ValueError, match="ND storage"):
+        functions["format_weight"]()
+
+
+@pytest.mark.parametrize("invalid", ["block", "transpose", "device"])
+def test_option_microbenchmark_keeps_validation(invalid):
+    functions, _, _, _, tensors, args = make_check_functions()
+    if invalid == "block":
+        args.block_shape = [24, 32, 64]
+    elif invalid == "transpose":
+        args.transpose_weight_tile = 1
+    else:
+        tensors[0].device.type = "cpu"
+    with pytest.raises((ValueError, TypeError)):
+        functions["option_metadata"]()
+
+
+def test_measure_host_has_only_boundary_syncs():
+    function, npu = Mock(), Mock()
+    with patch.object(diagnostic.time, "perf_counter", side_effect=[1, 1.002]):
+        elapsed = diagnostic.measure_host(function, npu, 100)
+    assert elapsed == pytest.approx(20)
+    assert function.call_count == 100
+    assert npu.synchronize.call_count == 2
+    npu.Event.assert_not_called()
+
+
+def test_graph_capture_counts_and_returns_live_output():
+    npu = Mock()
+    context = Mock()
+    context.__enter__, context.__exit__ = Mock(), Mock(return_value=False)
+    npu.graph.return_value = context
+    graph, tensor = Mock(), object()
+    npu.NPUGraph.return_value = graph
+    function = Mock(return_value=tensor)
+    captured, output = diagnostic.capture_graph(function, npu, 16)
+    assert captured is graph and output is tensor
+    assert function.call_count == 16
+    assert graph.replay.call_count == diagnostic.GRAPH_WARMUP_REPLAYS
+    assert npu.synchronize.call_count == 2
+
+
+def test_optional_modes_appear_in_dry_run_and_native_cases_rotate(capsys):
+    assert diagnostic.main(["--quant-model", "unused", "--include-qbmm", "--check-breakdown", "--dry-run"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    names = diagnostic.CASES + diagnostic.NATIVE_CASES
+    assert tuple(report["cases"]) == names
+    assert "check_note" in report
+    assert report["settings"]["check_iterations"] == 2048
+    for repeat in range(6):
+        assert set(diagnostic.case_order(repeat, names)) == set(names)
+    assert diagnostic.NATIVE_CASES[1] in diagnostic.GRAPH_CASES
+    assert diagnostic.NATIVE_CASES[0] not in diagnostic.GRAPH_CASES
+
+
+def test_check_csv_does_not_mix_host_microbench_with_device_timings(tmp_path):
+    result = sample_result()
+    result["check_samples_us"] = {"input_metadata": [10.5, 11.0], "format_all_four": [25.0]}
+    report = {
+        "status": "completed",
+        "settings": {"check_breakdown": True, "check_iterations": 2048},
+        "results": [result],
+    }
+    diagnostic.save_report(tmp_path, report)
+    with (tmp_path / "check_timings.csv").open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 3
+    assert rows[0] == {
+        "T": "512",
+        "check": "input_metadata",
+        "repeat": "0",
+        "iterations": "2048",
+        "host_call_us": "10.5",
+    }
+    assert "stream_us" not in rows[0]
+    assert not list(tmp_path.glob("*.tmp"))

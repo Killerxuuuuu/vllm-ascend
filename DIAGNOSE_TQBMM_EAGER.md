@@ -38,6 +38,51 @@ B/C 直接调用现有 JIT kernel，绝不复制或改写内核，也不预先�
 A 与 B 的 Python 包装实现有细微差异，因此 A−B 只能估计校验/包装开销，不能当作精确的纯校验成本。
 C 的输出只在本测试同一执行流中串行复用，不能推广成并发请求共享一个全局缓冲区。
 
+## 下一步：校验细分与同轮原生对照
+
+现已支持 `--check-breakdown` 和 `--include-qbmm`；旧命令默认仍保留 A/B/C/D 四组。
+同步更新后的脚本，然后执行：
+
+```bash
+cd /home/w00601343/vllm-ascend
+python -u diagnose_tqbmm_eager.py \
+  --quant-model /home/w00601343/outputs/dsv4-0731-w8a8-int8-with-wo-20261019-081956 \
+  --tokens 1 16 64 512 \
+  --block-shape 64 64 128 --num-stages 2 \
+  --warmup 20 --iterations 256 --repeats 5 \
+  --check-breakdown --check-iterations 2048 \
+  --include-qbmm \
+  --output /home/w00601343/tqbmm-checks-$(date +%Y%m%d-%H%M%S)
+```
+
+新增两条算子对照，使用同一份 INT8 输入和 scale，经过原输入、变更输入的严格数值检查：
+
+- `R_qbmm_eager`：原生拼接，包含每次调用的权重 contiguous/转置和输出 stack。
+- `R_qbmm_graph`：同一拼接流程的 Graph 回放；不会在计时外提前打包权重来改变基线。
+
+新增校验微测试，单独写入 `check_timings.csv` 和 JSON 的 `check_median_us`：
+
+| 标记 | 测量内容 |
+| --- | --- |
+| `empty_call_control` | 空 Python 函数循环，观察测量底噪，不自动扣减 |
+| `input_metadata` | 直接调用现有 `_validate_inputs`，检查 dtype/shape/device 等 |
+| `option_metadata` | stages、block shape、transpose 参数和 NPU 类型检查 |
+| `format_all_four` | 与完整接口相同的四个 tensor 格式查询/检查表达式 |
+| `format_x` / `format_weight` | 单独查询并检查输入/权重格式 |
+| `format_x_scale` / `format_weight_scale` | 单独查询并检查两个 scale 格式 |
+| `all_validation` | 依次执行参数检查、选项检查、四 tensor 格式检查 |
+
+校验微测试不执行矩阵乘、不分配输出；使用 CPU 墙钟计时，仅在循环两端同步。
+每轮每项执行 2048 次（可调整），统计单次平均耗时，再对多轮取中位数。
+如查询内部存在运行时阻塞，时间会包含它；不能在测试前预设格式查询一定触发同步。
+独立微测试不是完整调用中的精确时间切片，不能要求各项相加严格等于 A−B。
+`all_validation` 也包含诊断辅助函数调用开销，不覆盖完整接口的 shape/stride/grid 组装。
+
+这一步发回 `result.json`、`timings.csv`、`check_timings.csv` 三个文件。
+若 `format_all_four` 占主导，优先调查格式查询；若 `input_metadata` 占主导，优先调查重复元数据校验。
+若它们都远小于 A−B，继续定位包装实现及运行时差异，不据此删除保护检查。
+比较 Eager 用 A/C 对 R_qbmm_eager；比较 Graph 用 D 对 R_qbmm_graph，不能混用调用模式。
+
 每个 T 在计时前，先使用相同 INT8 输入和 scale 对原生 QBMM 拼接做零容差检查，
 再更换输入检查 A/B/C 和 Graph 回放；C 的输出预填 NaN，确保 kernel 完整写入。
 加载、动态量化、编译、正确性检查和 Graph 捕获都在计时区间外。
