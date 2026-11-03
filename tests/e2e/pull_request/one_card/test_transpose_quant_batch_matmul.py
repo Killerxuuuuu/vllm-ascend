@@ -170,9 +170,22 @@ def test_zero_tokens():
 
 def test_nz_storage_is_rejected():
     x = torch.ones(1, 1, 64, dtype=torch.int8, device="npu")
-    w = torch_npu.npu_format_cast(torch.ones(1, 64, 32, dtype=torch.int8, device="npu"), 29)
-    with pytest.raises(ValueError, match="ND storage"):
-        transpose_quant_batch_matmul(x, w, torch.ones(1, 1, device="npu"), torch.ones(1, 32, device="npu"))
+    sx = torch.ones(1, 1, device="npu")
+    sw = torch.ones(1, 32, device="npu")
+    nz_format = 29
+    # torch_npu 2.10's config attribute is write-only. Snapshot the actual
+    # option instead of reading config.allow_internal_format (not a getter).
+    previous = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT")
+    assert previous in (b"enable", b"disable"), f"Cannot snapshot internal format option: {previous!r}"
+    try:
+        torch_npu.npu.config.allow_internal_format = True
+        w = torch_npu.npu_format_cast(torch.ones(1, 64, 32, dtype=torch.int8, device="npu"), nz_format)
+        actual_format = torch_npu.get_npu_format(w)
+        assert actual_format == nz_format, f"Expected FRACTAL_NZ storage, got {actual_format}"
+        with pytest.raises(ValueError, match="ND storage"):
+            transpose_quant_batch_matmul(x, w, sx, sw)
+    finally:
+        torch_npu.npu.config.allow_internal_format = previous == b"enable"
 
 
 def test_graph_replay_reads_updated_inputs():
