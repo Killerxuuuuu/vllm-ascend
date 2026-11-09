@@ -679,6 +679,7 @@ def test_a3_int8_grouped_wo_a_uses_per_token_and_per_channel_scales():
         return ((x.float() @ w.float()) * pertoken_scale[:, None] * scale[None, :]).to(output_dtype)
 
     with (
+        patch("vllm_ascend.attention.dsa_v1.envs.VLLM_ASCEND_DSV4_WO_A_TRITON", False),
         patch.object(torch_npu, "npu_dynamic_quant", side_effect=fake_dynamic_quant) as dynamic_quant,
         patch.object(torch_npu, "npu_quant_matmul", side_effect=fake_quant_matmul) as qbmm,
     ):
@@ -712,7 +713,14 @@ def test_a3_int8_grouped_wo_a_selects_triton_explicitly():
         patch.object(torch_npu, "npu_quant_matmul") as qbmm,
     ):
         assert _a3_int8_grouped_wo_a(activations, weight, scales) is expected
-    fused.assert_called_once_with(activations, weight, scales)
+    fused.assert_called_once_with(
+        activations,
+        weight,
+        scales,
+        block_shape=(64, 64, 128),
+        num_stages=2,
+        transpose_weight_tile=False,
+    )
     qbmm.assert_not_called()
 
 

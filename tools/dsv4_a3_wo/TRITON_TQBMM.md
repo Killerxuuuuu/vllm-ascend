@@ -15,7 +15,7 @@ T=1/16/64/512 在 `16 32 32`、`num_stages=1` 下，两种数值比较均为 max
 
 - 仍使用 `tl.dot(INT8, INT8, INT32)`，不改输入类型、累加顺序或反量化顺序。
 - 保留每个 K tile 从基址计算地址的逻辑，以及原来的 mask/尾块处理。
-- 默认 N/K=32、num_stages=1；未经设备验证不自动提升生产分块或打开流水线。
+- 公共算子默认 N/K=32、num_stages=1；整网 opt-in 分支显式采用的候选见第 4 节，不改公共默认值。
 - 新增 `--transpose-weight-tile` 显式候选：按物理 `[N,K]` 加载小块，`tl.trans` 后交给
   相同的 `tl.dot`。它不复制整个权重、不改 scale，且默认关闭。
 - 不引入运行时 autotune、全局权重缓存或新的环境变量。离线推荐不会自动改部署配置。
@@ -221,6 +221,31 @@ export VLLM_ASCEND_DSV4_WO_A_TRITON=1
 但不改变绕过此 helper 的其他执行分支（例如直接调用 Linear 的 O-LoRA TP 分支）。
 开关开启时仅让 A3 INT8 wo_a 保持 ND，其他层沿用原 NZ 策略；不要额外全局关闭 NZ。
 该实验开关默认 0，需要代码评审和 A3 验证后才能考虑默认开启。
+
+### 整网调优候选接入（2026-11-09）
+
+当前 A3 Wo_a helper 在开关为 `1` 时，显式传入 `block_shape=(64,64,128)`、
+`num_stages=2`、`transpose_weight_tile=False`，不再沿用公共算子的保守默认分块。
+普通 DSA 和调用此 helper 的 CP 分支共用配置；绕过 helper 的路径不会因此改变。
+开关为 `0` 的原生拼接、公共算子默认值和 kernel 数学逻辑不变。
+这次没有接入 Prepared，也没有增加固定输出缓存。
+
+这组参数来自此前 T=1/16/64/512、G=1、K=4096、N=1024 的单算子测量，
+不是所有 shape 或整网 TTFT 的最优承诺。尤其需要在真实 prefill token 数上重新验证：
+
+```bash
+python -m pytest -q tests/ut/attention/test_dsa_v1.py -k a3_int8
+python -m pytest -q tests/e2e/pull_request/one_card/test_transpose_quant_batch_matmul.py
+
+# 示例；若实际 prefill 的最大 T 不同，改为对应值。
+python -m tools.dsv4_a3_wo.benchmark_tqbmm \
+  --quant-model "$QUANT_MODEL" --tp-size 8 --tp-rank 0 \
+  --tokens 8192 --block-shape 64 64 128 --num-stages 2 \
+  --strict --graph --check-only
+```
+
+同步源码后重启服务，保持原来的权重和压测参数，重新预热并保存到新的结果目录。
+只检查 `dynamic_quant_grouped_wo_a` 的签名仍会看到保守默认值；应检查整网 helper 的显式调用参数。
 
 回退时设为 `0` 或 unset，随后重启服务以重新加载原格式权重：
 

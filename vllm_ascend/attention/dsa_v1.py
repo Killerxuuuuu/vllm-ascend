@@ -69,6 +69,12 @@ else:
 # The SAS and QLI metadata operators use a fixed 1024-element int32 layout.
 DSA_METADATA_BUFFER_SIZE = 1024
 
+# Best measured Graph candidate for the experimental A3 INT8 Wo_a path. Keep the
+# public operator's conservative defaults unchanged; prefill/network gains
+# still need validation on the target shapes and server.
+A3_WO_A_TRITON_BLOCK_SHAPE = (64, 64, 128)
+A3_WO_A_TRITON_NUM_STAGES = 2
+
 _DSV4_DSA_OVERLAP_STREAM = None
 
 
@@ -93,7 +99,7 @@ def _a3_int8_grouped_wo_a(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
 ) -> torch.Tensor:
-    """Run grouped wo_a as per-token INT8 quantization plus 2-D QBMM.
+    """Run grouped INT8 wo_a with CANN composition or opt-in tuned Triton.
 
     The A3 path does not have the A5 batched quantized matmul. Keep the group
     dimension explicit so each QBMM receives a per-channel weight scale.
@@ -117,7 +123,14 @@ def _a3_int8_grouped_wo_a(
     if envs.VLLM_ASCEND_DSV4_WO_A_TRITON:
         if dynamic_quant_grouped_wo_a is None:
             raise RuntimeError("Triton wo_a was requested but Triton-Ascend is unavailable")
-        return dynamic_quant_grouped_wo_a(activations, weight, weight_scale)
+        return dynamic_quant_grouped_wo_a(
+            activations,
+            weight,
+            weight_scale,
+            block_shape=A3_WO_A_TRITON_BLOCK_SHAPE,
+            num_stages=A3_WO_A_TRITON_NUM_STAGES,
+            transpose_weight_tile=False,
+        )
 
     scales = weight_scale.reshape(num_groups, -1)
     outputs = []
