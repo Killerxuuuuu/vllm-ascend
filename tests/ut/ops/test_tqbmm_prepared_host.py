@@ -70,11 +70,27 @@ class Tensor:
             fmt=self.fmt,
         )
 
+    def view(self, *shape):
+        return Tensor(shape, self.dtype, self._storage, device=self.device, fmt=self.fmt)
+
+    def reshape(self, *shape):
+        return self.view(*shape)
+
+    def float(self):
+        if self.dtype == "f32":
+            return self
+        return Tensor(self.shape, "f32", Storage(self._storage.address + 1, self._storage.size), device=self.device)
+
+    def contiguous(self):
+        assert self._contiguous
+        return self
+
 
 class Backend:
     def __init__(self):
         self.addresses = count(1 << 40, 1 << 40)
         self.allocations, self.queries, self.launches = [], [], []
+        self.quantizations = []
 
     def tensor(self, shape, dtype, **kwargs):
         tensor = Tensor(shape, dtype, Storage(next(self.addresses), math.prod(shape) * 4), **kwargs)
@@ -87,6 +103,12 @@ class Backend:
     def get_format(self, tensor):
         self.queries.append(tensor)
         return tensor.fmt
+
+    def dynamic_quant(self, tensor, *, dst_type):
+        q = self.tensor(tensor.shape, dst_type, device=tensor.device)
+        scale = self.tensor((tensor.shape[0],), "f32", device=tensor.device)
+        self.quantizations.append((tensor, q, scale))
+        return q, scale
 
     def __getitem__(self, grid):
         def launch(*args, **kwargs):
@@ -112,7 +134,7 @@ def host(monkeypatch):
             float16="f16",
             empty=backend.empty,
         ),
-        torch_npu=SimpleNamespace(get_npu_format=backend.get_format),
+        torch_npu=SimpleNamespace(get_npu_format=backend.get_format, npu_dynamic_quant=backend.dynamic_quant),
         triton=SimpleNamespace(cdiv=lambda a, b: (a + b - 1) // b),
         _transpose_quant_batch_matmul_kernel=backend,
     )
@@ -266,3 +288,112 @@ def test_prepared_checks_options_at_construction(host, options):
     with pytest.raises((ValueError, TypeError)):
         module.PreparedTQBMM(*inputs(backend), **options)
     assert not backend.launches
+
+
+@pytest.mark.parametrize("scale_dtype", ["f32", "bf16", "f16"])
+def test_dynamic_plan_prepares_static_state_and_uses_fresh_inputs(host, scale_dtype):
+    module, backend = host
+    _, weight, _, scale = inputs(backend)
+    scale.dtype = scale_dtype
+    prepared = module.PreparedDynamicWoA(weight, scale, block_shape=(64, 64, 128), num_stages=2)
+    assert not backend.quantizations
+    assert prepared._scale.dtype == "f32"
+    assert prepared._weight._storage is weight._storage
+    initial_queries = len(backend.queries)
+    results = []
+    for tokens in (1, 512, 0, 17, 17):
+        activations = backend.tensor((tokens, 2, 65), "bf16")
+        results.append(prepared(activations))
+        assert results[-1].shape == (tokens, 2, 33)
+    assert len({id(output._storage) for output in results}) == len(results)
+    assert len(backend.quantizations) == len(backend.launches) == 4
+    # Only two dynamic formats are queried per non-empty call, not static weights.
+    assert len(backend.queries) - initial_queries == 8
+    for (_, q, sx), (grid, args, options) in zip(backend.quantizations, backend.launches):
+        assert args[0] is q and args[2] is sx
+        assert args[1] is prepared._weight and args[3] is prepared._scale
+        assert args[5:9] == (q.shape[0] // 2, 2, 65, 33)
+        assert args[9:12] == (130, 65, 1)
+        assert args[12:15] == weight.stride()
+        assert args[15:17] == (2, 1)
+        assert grid == ((args[5] + 63) // 64, 2)
+        assert options["BLOCK_K"] == 128 and options["num_stages"] == 2
+    with pytest.raises(FrozenInstanceError):
+        prepared._num_stages = 1
+
+
+@pytest.mark.parametrize("bad", ["shape", "dtype", "groups", "inner", "device"])
+def test_dynamic_plan_rejects_bad_activation_before_quantization(host, bad):
+    module, backend = host
+    _, weight, _, scale = inputs(backend)
+    prepared = module.PreparedDynamicWoA(weight, scale)
+    x = backend.tensor((17, 2, 65), "bf16")
+    if bad == "shape":
+        x.shape = (17, 130)
+    elif bad == "dtype":
+        x.dtype = "i8"
+    elif bad == "groups":
+        x.shape = (17, 1, 65)
+    elif bad == "inner":
+        x.shape = (17, 2, 64)
+    else:
+        x.device = Device(index=1)
+    with pytest.raises((ValueError, TypeError)):
+        prepared(x)
+    assert not backend.quantizations and not backend.launches
+
+
+@pytest.mark.parametrize("bad", ["dtype", "shape", "scale_dtype", "scale_size", "device", "strided", "nz", "scale_nz"])
+def test_dynamic_plan_checks_each_new_quant_result(host, monkeypatch, bad):
+    module, backend = host
+    _, weight, _, scale = inputs(backend)
+    prepared = module.PreparedDynamicWoA(weight, scale)
+    x = backend.tensor((17, 2, 65), "bf16")
+    prepared(x)
+    q = backend.tensor((34, 65), "i8")
+    sx = backend.tensor((34,), "f32")
+    if bad == "dtype":
+        q.dtype = "bf16"
+    elif bad == "shape":
+        q.shape = (17, 130)
+    elif bad == "scale_dtype":
+        sx.dtype = "bf16"
+    elif bad == "scale_size":
+        sx.shape = (17,)
+    elif bad == "device":
+        sx.device = Device(index=1)
+    elif bad == "strided":
+        q._contiguous = False
+    elif bad == "nz":
+        q.fmt = 29
+    else:
+        sx.fmt = 29
+    monkeypatch.setattr(module.torch_npu, "npu_dynamic_quant", lambda *args, **kwargs: (q, sx))
+    with pytest.raises(ValueError):
+        prepared(x)
+    assert len(backend.launches) == 1
+
+
+@pytest.mark.parametrize("bad", ["dtype", "shape", "zero", "overflow", "scale_dtype", "scale_size", "device", "nz"])
+def test_dynamic_plan_rejects_bad_static_state(host, bad):
+    module, backend = host
+    _, weight, _, scale = inputs(backend)
+    if bad == "dtype":
+        weight.dtype = "bf16"
+    elif bad == "shape":
+        weight.shape = (65, 66)
+    elif bad == "zero":
+        weight.shape = (0, 65, 33)
+    elif bad == "overflow":
+        weight.shape = (2, module.MAX_INT8_ACCUMULATION_K + 1, 33)
+    elif bad == "scale_dtype":
+        scale.dtype = "i8"
+    elif bad == "scale_size":
+        scale.shape = (1,)
+    elif bad == "device":
+        scale.device = Device(index=1)
+    else:
+        weight.fmt = 29
+    with pytest.raises((ValueError, TypeError)):
+        module.PreparedDynamicWoA(weight, scale)
+    assert not backend.launches and not backend.quantizations

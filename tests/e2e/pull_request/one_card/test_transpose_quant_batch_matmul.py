@@ -7,6 +7,7 @@ import torch_npu
 
 from tools.dsv4_a3_wo.benchmark_tqbmm import dynamic_qbmm_reference, qbmm_reference
 from vllm_ascend.ops.triton.transpose_quant_batch_matmul import (
+    PreparedDynamicWoA,
     PreparedTQBMM,
     dynamic_quant_grouped_wo_a,
     transpose_quant_batch_matmul,
@@ -289,3 +290,71 @@ def test_independent_prepared_bindings_on_two_streams():
     assert out1.data_ptr() != out2.data_ptr()
     torch.testing.assert_close(out1.cpu(), torch.full((16, 1, 32), 2.0, dtype=torch.bfloat16), rtol=0, atol=0)
     torch.testing.assert_close(out2.cpu(), torch.full((16, 1, 32), 4.0, dtype=torch.bfloat16), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tokens,groups", [(0, 1), (1, 1), (16, 1), (65, 2), (512, 1), (1024, 1)])
+@pytest.mark.parametrize("scale_dtype", [torch.bfloat16, torch.float32])
+def test_prepared_dynamic_wo_a_fresh_inputs_strict(tokens, groups, scale_dtype):
+    weight = torch.randint(-8, 9, (groups, 1024, 4096), dtype=torch.int8, device="npu").transpose(1, 2)
+    scale = (torch.rand(groups, 1024, device="npu") * 0.01).to(scale_dtype)
+    prepared = PreparedDynamicWoA(weight, scale, block_shape=(64, 64, 128), num_stages=2)
+    outputs, snapshots = [], []
+    for current_tokens in (tokens, tokens + 1):
+        # A different allocation and token count on EVERY call; no fixed-q binding.
+        x = torch.randn(groups, current_tokens, 4096, dtype=torch.bfloat16, device="npu").transpose(0, 1)
+        expected = dynamic_quant_grouped_wo_a(x, weight, scale, block_shape=(64, 64, 128), num_stages=2)
+        actual = prepared(x)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        outputs.append(actual)
+        snapshots.append(actual.clone())
+    # Keeping a previous output alive must not cause a later call to overwrite it.
+    for output, snapshot in zip(outputs, snapshots):
+        torch.testing.assert_close(output, snapshot, rtol=0, atol=0)
+    assert outputs[0].numel() == 0 or outputs[0].data_ptr() != outputs[1].data_ptr()
+
+
+def test_prepared_dynamic_wo_a_graph_reads_current_activations():
+    weight = torch.randint(-8, 9, (1, 1024, 4096), dtype=torch.int8, device="npu").transpose(1, 2)
+    scale = torch.full((1, 1024), 0.125, dtype=torch.bfloat16, device="npu")
+    x = torch.randn(16, 1, 4096, dtype=torch.bfloat16, device="npu")
+    prepared = PreparedDynamicWoA(weight, scale, block_shape=(64, 64, 128), num_stages=2)
+    prepared(x)
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        actual = prepared(x)
+    x.copy_(torch.randn_like(x))
+    graph.replay()
+    torch.npu.synchronize()
+    expected = dynamic_quant_grouped_wo_a(x, weight, scale, block_shape=(64, 64, 128), num_stages=2)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_prepared_dynamic_wo_a_fp16_tails():
+    weight = torch.randint(-8, 9, (2, 33, 65), dtype=torch.int8, device="npu").transpose(1, 2)
+    scale = torch.full((2, 33), 0.125, dtype=torch.float16, device="npu")
+    prepared = PreparedDynamicWoA(weight, scale, block_shape=(64, 64, 128), num_stages=2)
+    x = torch.randn(17, 2, 65, dtype=torch.float16, device="npu")
+    expected = dynamic_quant_grouped_wo_a(x, weight, scale, block_shape=(64, 64, 128), num_stages=2)
+    actual = prepared(x)
+    assert actual.dtype == torch.float16
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_prepared_dynamic_wo_a_readonly_plan_on_two_streams():
+    weight = torch.ones(1, 64, 32, dtype=torch.int8, device="npu")
+    scale = torch.full((1, 32), 0.125, device="npu")
+    first_x = torch.ones(16, 1, 64, dtype=torch.bfloat16, device="npu")
+    second_x = torch.full_like(first_x, 2)
+    prepared = PreparedDynamicWoA(weight, scale, block_shape=(64, 64, 128), num_stages=2)
+    prepared(first_x)
+    torch.npu.synchronize()
+    first_stream, second_stream = torch.npu.Stream(), torch.npu.Stream()
+    with torch.npu.stream(first_stream):
+        first = prepared(first_x)
+    with torch.npu.stream(second_stream):
+        second = prepared(second_x)
+    torch.npu.synchronize()
+    assert first.data_ptr() != second.data_ptr()
+    torch.testing.assert_close(first, dynamic_quant_grouped_wo_a(first_x, weight, scale), rtol=0, atol=0)
+    torch.testing.assert_close(second, dynamic_quant_grouped_wo_a(second_x, weight, scale), rtol=0, atol=0)

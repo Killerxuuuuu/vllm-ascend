@@ -326,6 +326,116 @@ class PreparedTQBMM:
         return self.output
 
 
+@dataclass(frozen=True, init=False, eq=False, repr=False)
+class PreparedDynamicWoA:
+    """Prepare immutable inference weights/configuration, not activation buffers.
+
+    Unlike PreparedTQBMM, each call quantizes the CURRENT activation and returns
+    a fresh output. No input copies or shared writable workspace are introduced.
+    Dynamic quant outputs are still checked (including ND format) on every call.
+    Weight/scale storage and VALUES must remain fixed for this plan's lifetime;
+    scales may be converted to FP32 once at construction. Rebuild after reload,
+    in-place weight/scale changes or TP/full-weight switching. Graph capture
+    records the current tensors as usual; replay must follow its buffer contract.
+    """
+
+    _weight: torch.Tensor
+    _scale: torch.Tensor
+    _dimensions: tuple
+    _weight_strides: tuple
+    _scale_strides: tuple
+    _block_shape: tuple
+    _num_stages: int
+    _transpose_weight_tile: bool
+
+    def __init__(self, weight, weight_scale, *, block_shape=None, num_stages=1, transpose_weight_tile=False):
+        if weight.ndim != 3 or weight.dtype != torch.int8:
+            raise ValueError("Prepared Wo_a requires INT8 weight=[G,K,N]")
+        groups, inner, columns = weight.shape
+        if min(groups, inner, columns) <= 0 or inner > MAX_INT8_ACCUMULATION_K:
+            raise ValueError("Prepared Wo_a requires positive G,K,N and an INT32-safe K")
+        if weight.device.type != "npu" or weight_scale.device != weight.device:
+            raise ValueError("Prepared Wo_a weights and scales must share an NPU device")
+        if weight_scale.numel() != groups * columns:
+            raise ValueError("Prepared Wo_a requires one scale per output channel")
+        if weight_scale.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise TypeError("Prepared Wo_a requires floating-point weight scales")
+        block_shape = _resolve_launch_options(0, block_shape, num_stages, transpose_weight_tile)
+        if any(torch_npu.get_npu_format(tensor) not in (0, 2) for tensor in (weight, weight_scale)):
+            raise ValueError("TQBMM requires ND storage; NZ is not supported")
+        bound_weight = weight.detach()
+        # Check the actual normalized scale, including any cold conversion.
+        scale = weight_scale.detach().reshape(groups, columns).float()
+        if torch_npu.get_npu_format(scale) not in (0, 2):
+            raise ValueError("TQBMM requires ND storage; NZ is not supported")
+        object.__setattr__(self, "_weight", bound_weight)
+        object.__setattr__(self, "_scale", scale)
+        object.__setattr__(self, "_dimensions", (groups, inner, columns))
+        object.__setattr__(self, "_weight_strides", bound_weight.stride())
+        object.__setattr__(self, "_scale_strides", scale.stride())
+        object.__setattr__(self, "_block_shape", block_shape)
+        object.__setattr__(self, "_num_stages", num_stages)
+        object.__setattr__(self, "_transpose_weight_tile", transpose_weight_tile)
+
+    def __call__(self, activations):
+        groups, inner, columns = self._dimensions
+        if activations.ndim != 3 or activations.shape[1:] != (groups, inner):
+            raise ValueError("Prepared Wo_a activation must match [T,G,K]")
+        if activations.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError("Prepared Wo_a requires BF16/FP16 activations")
+        if activations.device != self._weight.device:
+            raise ValueError("Prepared Wo_a activation and weight must share a device")
+        tokens = activations.shape[0]
+        output = torch.empty((tokens, groups, columns), dtype=activations.dtype, device=activations.device)
+        if not tokens:
+            return output
+        quantized, scales = torch_npu.npu_dynamic_quant(
+            activations.contiguous().view(tokens * groups, inner), dst_type=torch.int8
+        )
+        # These tensors are newly returned by CANN, not bound during preparation.
+        # Do not skip their format/layout checks or reuse a previous call's ptrs.
+        if (
+            quantized.dtype != torch.int8
+            or quantized.shape != (tokens * groups, inner)
+            or scales.dtype != torch.float32
+            or scales.numel() != tokens * groups
+            or quantized.device != activations.device
+            or scales.device != activations.device
+            or not quantized.is_contiguous()
+            or not scales.is_contiguous()
+        ):
+            raise ValueError("Prepared Wo_a requires contiguous INT8/FP32 dynamic quant outputs")
+        if any(torch_npu.get_npu_format(tensor) not in (0, 2) for tensor in (quantized, scales)):
+            raise ValueError("TQBMM requires ND storage; NZ is not supported")
+        block_m, block_n, block_k = self._block_shape
+        grid = (triton.cdiv(tokens, block_m) * triton.cdiv(columns, block_n), groups)
+        _transpose_quant_batch_matmul_kernel[grid](
+            quantized,
+            self._weight,
+            scales,
+            self._scale,
+            output,
+            tokens,
+            groups,
+            inner,
+            columns,
+            groups * inner,
+            inner,
+            1,
+            *self._weight_strides,
+            groups,
+            1,
+            *self._scale_strides,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            GROUP_SIZE_M=DEFAULT_GROUP_SIZE_M,
+            TRANSPOSE_WEIGHT_TILE=self._transpose_weight_tile,
+            num_stages=self._num_stages,
+        )
+        return output
+
+
 def dynamic_quant_grouped_wo_a(
     activations, weight, weight_scale, *, block_shape=None, num_stages=1, transpose_weight_tile=False, out=None
 ):

@@ -60,10 +60,11 @@ if TYPE_CHECKING:
 
 if HAS_TRITON:
     from vllm_ascend.ops.triton.rms_norm import triton_q_rms  # noqa: F811
-    from vllm_ascend.ops.triton.transpose_quant_batch_matmul import dynamic_quant_grouped_wo_a
+    from vllm_ascend.ops.triton.transpose_quant_batch_matmul import PreparedDynamicWoA, dynamic_quant_grouped_wo_a
 else:
     triton_q_rms = None  # type: ignore
     dynamic_quant_grouped_wo_a = None
+    PreparedDynamicWoA = None  # type: ignore
 
 
 # The SAS and QLI metadata operators use a fixed 1024-element int32 layout.
@@ -146,6 +147,41 @@ def _a3_int8_grouped_wo_a(
             )
         )
     return torch.stack(outputs, dim=1)
+
+
+def _wo_a_tensor_signature(tensor):
+    """Host metadata only; detect replaced/rebound weights without format queries."""
+    return (id(tensor), tensor.data_ptr(), tuple(tensor.shape), tensor.stride(), tensor.dtype, tensor.device)
+
+
+def _a3_int8_grouped_wo_a_for_layer(owner, activations, num_groups):
+    """Prepare static Wo_a state once per attention instance, not per batch.
+
+    CP full-weight pools can be overwritten in place with unchanged addresses.
+    Keep that path checked and uncached; a pointer-keyed FP32 scale snapshot
+    would otherwise become stale. The direct O-LoRA TP Linear path is unchanged.
+    """
+    if not envs.VLLM_ASCEND_DSV4_WO_A_TRITON or getattr(owner, "enable_dsa_cp_with_o_proj_tp", False):
+        return _a3_int8_grouped_wo_a(
+            activations, owner._get_batched_wo_a_weight(num_groups), owner._get_batched_wo_a_scale(num_groups)
+        )
+    if PreparedDynamicWoA is None:
+        raise RuntimeError("Triton wo_a was requested but Triton-Ascend is unavailable")
+    key = (_wo_a_tensor_signature(owner.wo_a.weight), _wo_a_tensor_signature(owner.wo_a.weight_scale), num_groups)
+    cached = getattr(owner, "_a3_wo_a_prepared", None)
+    if cached is None or cached[0] != key:
+        prepared = PreparedDynamicWoA(
+            owner._get_batched_wo_a_weight(num_groups),
+            owner._get_batched_wo_a_scale(num_groups),
+            block_shape=A3_WO_A_TRITON_BLOCK_SHAPE,
+            num_stages=A3_WO_A_TRITON_NUM_STAGES,
+            transpose_weight_tile=False,
+        )
+        cached = (key, prepared)
+        owner._a3_wo_a_prepared = cached
+    # Plans contain read-only weights/configuration only. Each launch owns its
+    # dynamic quant outputs and result; no cross-request writable buffer cache.
+    return cached[1](activations)
 
 
 class AscendDSABackend(AttentionBackend):
@@ -1304,11 +1340,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             dist.all_to_all_single(recv.view(-1), send.view(-1), group=oproj_group.device_group)
             o_proj_input = recv.view(oproj_tp_size * exchange_num_tokens, groups_per_rank, group_hidden_dim)
             if a3_int8_wo_a:
-                o_proj_input = _a3_int8_grouped_wo_a(
-                    o_proj_input,
-                    self._get_batched_wo_a_weight(groups_per_rank),
-                    self._get_batched_wo_a_scale(groups_per_rank),
-                )
+                o_proj_input = _a3_int8_grouped_wo_a_for_layer(self, o_proj_input, groups_per_rank)
             else:
                 o_proj_input = torch_npu.npu_transpose_batchmatmul(
                     o_proj_input,
@@ -1340,11 +1372,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             output[...] = self.wo_b(o_proj_input)
         else:
             if a3_int8_wo_a:
-                o_proj_input = _a3_int8_grouped_wo_a(
-                    o_proj_input,
-                    self._get_batched_wo_a_weight(self.n_local_groups),
-                    self._get_batched_wo_a_scale(self.n_local_groups),
-                )
+                o_proj_input = _a3_int8_grouped_wo_a_for_layer(self, o_proj_input, self.n_local_groups)
             else:
                 o_proj_input = torch_npu.npu_transpose_batchmatmul(
                     o_proj_input,

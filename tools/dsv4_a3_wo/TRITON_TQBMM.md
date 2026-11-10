@@ -228,7 +228,9 @@ export VLLM_ASCEND_DSV4_WO_A_TRITON=1
 `num_stages=2`、`transpose_weight_tile=False`，不再沿用公共算子的保守默认分块。
 普通 DSA 和调用此 helper 的 CP 分支共用配置；绕过 helper 的路径不会因此改变。
 开关为 `0` 的原生拼接、公共算子默认值和 kernel 数学逻辑不变。
-这次没有接入 Prepared，也没有增加固定输出缓存。
+该次参数变更没有增加固定输出缓存。2026-11-10 起，普通静态权重路径进一步使用
+`PreparedDynamicWoA` 预准备静态状态；动态输入和输出不固定复用。
+CP full-weight 池切换路径仍使用安全动态接口，参见 [Prepared 契约](../../PREPARED_TQBMM.md)。
 
 这组参数来自此前 T=1/16/64/512、G=1、K=4096、N=1024 的单算子测量，
 不是所有 shape 或整网 TTFT 的最优承诺。尤其需要在真实 prefill token 数上重新验证：

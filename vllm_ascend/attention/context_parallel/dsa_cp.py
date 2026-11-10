@@ -1489,11 +1489,7 @@ class AscendDSACPImpl(AttentionImplBase[Any]):
                 and not olora_tp_enable()
             ):
                 o = o_proj_input.view(num_tokens, o_proj_groups, -1)
-                o = dsa_v1._a3_int8_grouped_wo_a(
-                    o,
-                    self._get_batched_wo_a_weight(o_proj_groups),
-                    self._get_batched_wo_a_scale(o_proj_groups),
-                )
+                o = dsa_v1._a3_int8_grouped_wo_a_for_layer(self, o, o_proj_groups)
                 local_output = self._apply_wo_b(o.reshape(num_tokens, -1), full_gather_wo_a_enabled)
             else:
                 o_proj_input = o_proj_input.view(num_tokens, o_proj_groups, -1)
