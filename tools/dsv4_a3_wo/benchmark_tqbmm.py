@@ -6,6 +6,8 @@ Run from the repository root with ``python -m tools.dsv4_a3_wo.benchmark_tqbmm``
 
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
 from statistics import median
 
@@ -14,6 +16,7 @@ import torch_npu
 
 from tools.dsv4_a3_wo.qbmm_probe import check_offset, error_metrics, load_group_count, load_scale, load_tensor
 from vllm_ascend.ops.triton.transpose_quant_batch_matmul import (
+    PreparedDynamicWoA,
     dynamic_quant_grouped_wo_a,
     transpose_quant_batch_matmul,
 )
@@ -222,19 +225,21 @@ def elapsed_ms(function, warmup, iterations, *, timing_mode="eager", graph_batch
 
 
 def collect_timings(functions, args, timing_mode):
-    samples = {
-        name: [
-            elapsed_ms(
-                function,
-                args.warmup,
-                args.iterations,
-                timing_mode=timing_mode,
-                graph_batch_size=args.graph_batch_size,
+    # Alternate the order between repeats instead of timing all Triton samples
+    # before all native samples. Compilation/capture remain outside the timer.
+    samples = {name: [] for name in functions}
+    items = list(functions.items())
+    for repeat in range(args.repeats):
+        for name, function in items if repeat % 2 == 0 else reversed(items):
+            samples[name].append(
+                elapsed_ms(
+                    function,
+                    args.warmup,
+                    args.iterations,
+                    timing_mode=timing_mode,
+                    graph_batch_size=args.graph_batch_size,
+                )
             )
-            for _ in range(args.repeats)
-        ]
-        for name, function in functions.items()
-    }
     durations = {name: median(values) for name, values in samples.items()}
     durations["prequantized_speedup"] = durations["qbmm_composition_prequantized"] / durations["triton_prequantized"]
     durations["including_quant_speedup"] = (
@@ -283,6 +288,19 @@ def run(args):
     if not torch.npu.is_available() or get_ascend_device_type() != AscendDeviceType.A3:
         raise RuntimeError("This probe requires an Ascend A3 NPU and Triton-Ascend")
     torch.npu.set_device(args.device)
+    internal_format = getattr(args, "allow_internal_format", "inherit")
+    if internal_format != "inherit":
+        torch.npu.config.allow_internal_format = internal_format == "on"
+    instrumentation = {
+        "memscope_modules": sorted(name for name in sys.modules if "msmemscope" in name.lower()),
+        "preload_hooks": [
+            entry
+            for entry in os.environ.get("LD_PRELOAD", "").replace(":", " ").split()
+            if any(marker in entry.lower() for marker in ("msmemscope", "leaks_ascend", "ascend_kernel_hook"))
+        ],
+    }
+    if getattr(args, "reject_instrumentation", False) and any(instrumentation.values()):
+        raise RuntimeError("msMemScope instrumentation detected; unload its API environment before benchmarking")
     torch.manual_seed(args.seed)
     if args.quant_model:
         weight, sw = load_wo_a(args)
@@ -310,17 +328,35 @@ def run(args):
     def reference():
         return qbmm_reference(x, weight, sx, sw, torch.bfloat16)
 
+    prepared_dynamic = getattr(args, "prepared_dynamic", False)
+    dynamic_plan = (
+        PreparedDynamicWoA(
+            weight,
+            sw,
+            block_shape=block_shape,
+            num_stages=args.num_stages,
+            transpose_weight_tile=args.transpose_weight_tile,
+        )
+        if prepared_dynamic
+        else None
+    )
+
+    def dynamic_fused():
+        if dynamic_plan is not None:
+            return dynamic_plan(activations)
+        return dynamic_quant_grouped_wo_a(
+            activations,
+            weight,
+            sw,
+            block_shape=block_shape,
+            num_stages=args.num_stages,
+            transpose_weight_tile=args.transpose_weight_tile,
+        )
+
     actual, expected = fused(), reference()
     rtol, atol = (0, 0) if args.strict else (0.01, 0.02)
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, equal_nan=False)
-    dynamic_actual = dynamic_quant_grouped_wo_a(
-        activations,
-        weight,
-        sw,
-        block_shape=block_shape,
-        num_stages=args.num_stages,
-        transpose_weight_tile=args.transpose_weight_tile,
-    )
+    dynamic_actual = dynamic_fused()
     dynamic_expected = dynamic_qbmm_reference(activations, weight, sw)
     torch.testing.assert_close(dynamic_actual, dynamic_expected, rtol=rtol, atol=atol, equal_nan=False)
     report = {
@@ -329,6 +365,15 @@ def run(args):
         "quant_model": str(args.quant_model) if args.quant_model else None,
         "torch": torch.__version__,
         "torch_npu": torch_npu.__version__,
+        "benchmark_source": str(Path(__file__).resolve()),
+        "allow_internal_format": bool(torch.npu.config.allow_internal_format),
+        "requested_internal_format": internal_format,
+        "input_storage_formats": {
+            "weight": torch_npu.get_npu_format(weight),
+            "quantized_activation": torch_npu.get_npu_format(x),
+        },
+        "prepared_dynamic": prepared_dynamic,
+        "instrumentation": instrumentation,
         "num_stages": args.num_stages,
         "requested_block_shape": block_shape,
         "transpose_weight_tile": args.transpose_weight_tile,
@@ -343,14 +388,7 @@ def run(args):
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
-            captured = dynamic_quant_grouped_wo_a(
-                activations,
-                weight,
-                sw,
-                block_shape=block_shape,
-                num_stages=args.num_stages,
-                transpose_weight_tile=args.transpose_weight_tile,
-            )
+            captured = dynamic_fused()
         # Replay with changed inputs, not just a repeated captured answer.
         activations.mul_(0.5)
         graph.replay()
@@ -366,14 +404,7 @@ def run(args):
         functions = {
             "triton_prequantized": fused,
             "qbmm_composition_prequantized": reference,
-            "triton_including_quant": lambda: dynamic_quant_grouped_wo_a(
-                activations,
-                weight,
-                sw,
-                block_shape=block_shape,
-                num_stages=args.num_stages,
-                transpose_weight_tile=args.transpose_weight_tile,
-            ),
+            "triton_including_quant": dynamic_fused,
             "qbmm_composition_including_quant": lambda: dynamic_qbmm_reference(activations, weight, sw),
         }
         report["timing_samples_ms"] = {}
@@ -393,6 +424,9 @@ def parse_args():
     parser.add_argument("--inner", type=int, default=4096)
     parser.add_argument("--columns", type=int, default=1024)
     parser.add_argument("--device", default="npu:0")
+    parser.add_argument("--allow-internal-format", choices=("inherit", "on", "off"), default="inherit")
+    parser.add_argument("--prepared-dynamic", action="store_true", help="Use the server's PreparedDynamicWoA path")
+    parser.add_argument("--reject-instrumentation", action="store_true", help="Reject detected msMemScope injection")
     parser.add_argument("--quant-model", type=Path)
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--tp-size", type=int, default=8)
