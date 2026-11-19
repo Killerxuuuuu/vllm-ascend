@@ -371,7 +371,29 @@ def run(args):
 
     actual, expected = fused(), reference()
     rtol, atol = (0, 0) if args.strict else (0.01, 0.02)
-    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, equal_nan=False)
+    try:
+        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol, equal_nan=False)
+    except AssertionError:
+        if getattr(args, "failure_dir", None) is not None:
+            try:
+                # Import and collect only AFTER failure. Do not warm up either
+                # implementation or change the original first-call ordering.
+                from tools.dsv4_a3_wo.tqbmm_failure import dump_failure
+
+                directory = dump_failure(
+                    args=args,
+                    x=x,
+                    weight=weight,
+                    sx=sx,
+                    sw=sw,
+                    actual=actual,
+                    native=expected,
+                    torch_module=torch,
+                )
+                print(f"Correctness failure saved: {directory}", flush=True)
+            except Exception as diagnostic_error:
+                print(f"Failure capture error: {diagnostic_error}", file=sys.stderr, flush=True)
+        raise
     dynamic_actual = dynamic_fused()
     dynamic_expected = dynamic_qbmm_reference(activations, weight, sw)
     torch.testing.assert_close(dynamic_actual, dynamic_expected, rtol=rtol, atol=atol, equal_nan=False)
@@ -471,6 +493,11 @@ def parse_args():
     parser.add_argument("--graph-batch-size", type=int, default=DEFAULT_GRAPH_BATCH_SIZE)
     parser.add_argument("--strict", action="store_true", help="Require exactly equal outputs before timing")
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument(
+        "--failure-dir",
+        type=Path,
+        help="After initial INT8 comparison fails, save tensors and CPU-golden samples here; no extra warmup",
+    )
     parser.add_argument("--graph", action="store_true")
     args = parser.parse_args()
     if (
