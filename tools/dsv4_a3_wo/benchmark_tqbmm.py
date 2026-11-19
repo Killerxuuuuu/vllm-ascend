@@ -382,7 +382,7 @@ def run(args):
         "torch": torch.__version__,
         "torch_npu": torch_npu.__version__,
         "benchmark_source": str(Path(__file__).resolve()),
-        "allow_internal_format": bool(torch.npu.config.allow_internal_format),
+        "allow_internal_format": bool(torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT")),
         "requested_internal_format": internal_format,
         "input_storage_formats": {
             "weight": torch_npu.get_npu_format(weight),
