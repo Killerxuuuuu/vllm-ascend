@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only orchestration tests. Run with --noconftest; no NPU validation."""
 
+import ast
 import json
 import subprocess
 import sys
@@ -12,6 +13,22 @@ from unittest.mock import Mock, patch
 import pytest
 
 import profile_tqbmm as profiling
+from tools.dsv4_a3_wo.runtime_options import internal_format_enabled
+
+
+@pytest.mark.parametrize("value", [False, b"disable", "disable"])
+def test_disabled_internal_format_is_not_bytes_truthiness(value):
+    assert internal_format_enabled(value) is False
+
+
+@pytest.mark.parametrize("value", [True, b"enable", "enable"])
+def test_enabled_internal_format(value):
+    assert internal_format_enabled(value) is True
+
+
+def test_unknown_internal_format_fails_instead_of_misreporting():
+    with pytest.raises(ValueError):
+        internal_format_enabled(None)
 
 
 def model_args(tmp_path):
@@ -37,9 +54,15 @@ def fake_worker(command, **kwargs):
     create_analysis(case_dir)
     batch = int(command[command.index("--graph-batch-size") + 1])
     replays = int(command[command.index("--replays") + 1])
+    args = profiling.parse_args(command[3:])
     profiling.write_manifest(
         case_dir / "capture.json",
-        {"case": name, "strict_correctness": True, "operator_calls": batch * replays},
+        {
+            "case": name,
+            "strict_correctness": True,
+            "operator_calls": batch * replays,
+            "launch_options": profiling.launch_options(args),
+        },
     )
     kwargs["stdout"].write(f"worker log: {name}\n")
     return SimpleNamespace(returncode=0)
@@ -49,6 +72,8 @@ def test_defaults_and_equal_call_counts():
     args = profiling.parse_args(["--quant-model", "unused"])
     assert args.block_shape == [64, 64, 128]
     assert args.num_stages == 2
+    assert args.reuse_m == 1
+    assert args.allow_internal_format == "inherit"
     assert not args.transpose_weight_tile
     plan = profiling.case_plan(args)
     assert [case["case"] for case in plan] == list(profiling.PROFILE_CASES)
@@ -71,6 +96,8 @@ def test_defaults_and_equal_call_counts():
         ["--block-shape", "24", "32", "64"],
         ["--block-shape", "16", "32", "16"],
         ["--num-stages", "3"],
+        ["--reuse-m", "3"],
+        ["--allow-internal-format", "invalid"],
         ["--worker-case", "triton_graph"],
     ],
 )
@@ -107,6 +134,11 @@ def test_worker_command_forwards_options(tmp_path):
             "128",
             "--num-stages",
             "1",
+            "--reuse-m",
+            "2",
+            "--allow-internal-format",
+            "on",
+            "--reject-instrumentation",
             "--seed",
             "7",
             "--tp-rank",
@@ -128,6 +160,25 @@ def test_worker_command_forwards_options(tmp_path):
     assert (forwarded.tokens, forwarded.num_stages, forwarded.seed, forwarded.tp_rank) == (64, 1, 7, 2)
     assert (forwarded.replays, forwarded.graph_batch_size) == (3, 8)
     assert forwarded.transpose_weight_tile
+    assert forwarded.reuse_m == 2
+    assert forwarded.allow_internal_format == "on"
+    assert forwarded.reject_instrumentation
+
+
+def test_capture_passes_reuse_m_to_the_actual_kernel():
+    tree = ast.parse(Path(profiling.__file__).read_text(encoding="utf-8"))
+    capture = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "capture_case")
+    calls = [
+        node
+        for node in ast.walk(capture)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "transpose_quant_batch_matmul"
+    ]
+    assert len(calls) == 1
+    options = {keyword.arg: ast.unparse(keyword.value) for keyword in calls[0].keywords}
+    assert options["reuse_m"] == "args.reuse_m"
+    assert options["num_stages"] == "args.num_stages"
 
 
 def test_dry_run_does_not_touch_files_or_launch_workers(tmp_path, capsys):
@@ -195,16 +246,19 @@ def test_complete_parent_run_and_archive(tmp_path):
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["status"] == "completed"
     assert all(case["status"] == "completed" and case["wall_seconds"] >= 0 for case in manifest["cases"])
-    assert len(list((output / "export").iterdir())) == 12
+    assert len(list((output / "export").iterdir())) == 16
+    focus = json.loads((output / "export" / "triton_graph__pipeline_focus.json").read_text(encoding="utf-8"))
+    assert focus["capture"]["launch_options"]["reuse_m"] == 1
+    assert focus["overview"]["valid_calls"] == 1
     assert "worker log: qbmm_graph" in (output / "collect.log").read_text()
     with tarfile.open(output / "export.tar.gz") as archive:
-        assert len(archive.getnames()) == 14
+        assert len(archive.getnames()) == 18
         assert not any("raw" in name for name in archive.getnames())
         packed = json.load(archive.extractfile("manifest.json"))
         assert packed["status"] == "completed"
 
 
-@pytest.mark.parametrize("failure", ["exit", "timeout", "interrupt", "missing", "count", "incorrect"])
+@pytest.mark.parametrize("failure", ["exit", "timeout", "interrupt", "missing", "count", "incorrect", "launch"])
 def test_failure_stops_and_preserves_results(tmp_path, failure):
     argv, output = model_args(tmp_path)
 
@@ -225,7 +279,10 @@ def test_failure_stops_and_preserves_results(tmp_path, failure):
             next(case_dir.rglob("trace_view.json")).unlink()
         else:
             metadata = json.loads((case_dir / "capture.json").read_text())
-            metadata["operator_calls" if failure == "count" else "strict_correctness"] = 0
+            if failure == "launch":
+                metadata["launch_options"]["reuse_m"] = 2
+            else:
+                metadata["operator_calls" if failure == "count" else "strict_correctness"] = 0
             profiling.write_manifest(case_dir / "capture.json", metadata)
         return result
 

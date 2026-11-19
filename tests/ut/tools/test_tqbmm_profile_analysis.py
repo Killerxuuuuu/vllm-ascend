@@ -48,6 +48,20 @@ def test_header_aliases_bom_and_zero_duration(tmp_path):
     assert aggregate.devices == {"0": 1}
 
 
+def test_pipeline_times_above_one_and_missing_coverage(tmp_path):
+    headers = ["Name", "Duration(us)", "aic_mte2_time(us)", "aic_mac_time(us)", "aic_scalar_time(us)"]
+    source = write_csv(
+        tmp_path / "kernel_details.csv",
+        [["QuantBatchMatMul", 100, 90, 20, "N/A"], ["QuantBatchMatMul", 200, 180, "N/A", "N/A"]],
+        headers,
+    )
+    aggregate, _ = analysis.read_source(source)
+    counters = next(iter(aggregate.names.values())).report(300)["counter_call_means"]
+    assert counters["aic_mte2_time(us)"] == {"mean": 135, "covered_calls": 2}
+    assert counters["aic_mac_time(us)"] == {"mean": 20, "covered_calls": 1}
+    assert "aic_scalar_time(us)" not in counters
+
+
 @pytest.mark.parametrize("bad", ["nan", "inf", "-1", "N/A", "", "junk"])
 def test_invalid_rows_are_counted(tmp_path, bad):
     source = write_csv(tmp_path / "kernel_details.csv", [["a", bad, "", ""], ["b", 5, "", ""]])

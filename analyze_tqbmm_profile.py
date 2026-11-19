@@ -31,6 +31,16 @@ PATH_LIMIT = 600
 CSV_FIELD_LIMIT = 16 * 1024 * 1024
 FOCUS_FAMILIES = ("triton_tqbmm", "native_quant_matmul_candidate", "other_matmul", "layout", "quantization")
 COUNTER_FIELDS = ("aic_mac_ratio", "aic_mte2_ratio", "aiv_vec_ratio")
+PIPELINE_TIME_FIELDS = (
+    "aicore_time(us)",
+    "aic_mte2_time(us)",
+    "aic_mac_time(us)",
+    "aic_mte1_time(us)",
+    "aic_scalar_time(us)",
+    "aic_fixpipe_time(us)",
+    "aiv_vec_time(us)",
+    "aiv_scalar_time(us)",
+)
 MISSING_VALUES = ("", "n/a", "na", "none", "null", "--")
 
 
@@ -152,10 +162,10 @@ class Aggregator:
             self.missing_shapes += count
         counters = {}
         if not summary:
-            for key in COUNTER_FIELDS:
+            for key in (*COUNTER_FIELDS, *PIPELINE_TIME_FIELDS):
                 try:
                     value = number(row.get(key, ""))
-                    if value <= 1:
+                    if key in PIPELINE_TIME_FIELDS or value <= 1:
                         counters[key] = value
                 except (ValueError, TypeError):
                     pass
@@ -249,6 +259,7 @@ def make_report(aggregate, source, discovered, upstream, top, label):
         "类别由名称启发式匹配。原生 QuantMatMul/Transpose/Stack 不能仅凭名字认定为 Wo_a；也不能直接相加当 Wo_a 耗时。",
         "CSV/汇总 JSON 不能证明 Graph 回放、Prepared 命中或采集完整，也无法独立定位 Python Host 开销。",
         "不能从均值/最值重建 P50/P99；counter_call_means 是有数据调用的计数加权平均，不是带宽/峰值算力利用率。",
+        "流水 time(us) 可相互重叠，不能相加或从 Duration 相减推算空闲；缺失 PMU 字段不按零处理。",
         "若采集日志出现 collected data has been lost/TLV 警告，本报告仍可能基于不完整数据；请一并提供该警告。",
         "跨实验仅比较相同 rank、负载、采集区间和配置；不要将不同 TP/DP rank 累加成端到端耗时。",
     ]

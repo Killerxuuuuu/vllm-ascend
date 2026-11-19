@@ -9,6 +9,7 @@ the unprofiled benchmark. Only readable analysis copies and logs are archived.
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,9 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+
+from analyze_tqbmm_profile import make_report, read_source, serialize_bounded
+from tools.dsv4_a3_wo.runtime_options import internal_format_enabled
 
 REPO_ROOT = Path(__file__).resolve().parent
 PROFILE_CASES = ("triton_eager", "triton_graph", "qbmm_eager", "qbmm_graph")
@@ -40,6 +44,9 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--block-shape", type=int, nargs=3, default=[64, 64, 128], metavar=("M", "N", "K"))
     parser.add_argument("--num-stages", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--reuse-m", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--allow-internal-format", choices=("inherit", "on", "off"), default="inherit")
+    parser.add_argument("--reject-instrumentation", action="store_true", help="Reject detected msMemScope hooks")
     parser.add_argument("--transpose-weight-tile", action="store_true")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--graph-batch-size", type=int, default=DEFAULT_GRAPH_BATCH_SIZE)
@@ -76,6 +83,15 @@ def case_plan(args):
     ]
 
 
+def launch_options(args):
+    return {
+        "block_shape": args.block_shape,
+        "num_stages": args.num_stages,
+        "reuse_m": args.reuse_m,
+        "transpose_weight_tile": args.transpose_weight_tile,
+    }
+
+
 def worker_command(args, name, output):
     command = [
         sys.executable,
@@ -103,6 +119,10 @@ def worker_command(args, name, output):
         *map(str, args.block_shape),
         "--num-stages",
         str(args.num_stages),
+        "--reuse-m",
+        str(args.reuse_m),
+        "--allow-internal-format",
+        args.allow_internal_format,
         "--warmup",
         str(args.warmup),
         "--graph-batch-size",
@@ -110,16 +130,22 @@ def worker_command(args, name, output):
         "--replays",
         str(args.replays),
     ]
-    return command + (["--transpose-weight-tile"] if args.transpose_weight_tile else [])
+    if args.transpose_weight_tile:
+        command.append("--transpose-weight-tile")
+    if args.reject_instrumentation:
+        command.append("--reject-instrumentation")
+    return command
 
 
 def run_profile_calls(function, graph, batch_size, replays):
+    result = None
     if graph is None:
         for _ in range(batch_size * replays):
-            function()
+            result = function()
     else:
         for _ in range(replays):
             graph.replay()
+    return result
 
 
 def capture_case(args):
@@ -134,7 +160,19 @@ def capture_case(args):
 
     if not torch.npu.is_available() or get_ascend_device_type() != AscendDeviceType.A3:
         raise RuntimeError("This profiling script requires an Ascend A3 NPU")
+    instrumentation = {
+        "memscope_modules": sorted(name for name in sys.modules if "msmemscope" in name.lower()),
+        "preload_hooks": [
+            entry
+            for entry in os.environ.get("LD_PRELOAD", "").replace(":", " ").split()
+            if any(marker in entry.lower() for marker in ("msmemscope", "leaks_ascend", "ascend_kernel_hook"))
+        ],
+    }
+    if args.reject_instrumentation and any(instrumentation.values()):
+        raise RuntimeError("msMemScope hooks detected; unload its API environment before collecting")
     torch.npu.set_device(args.device)
+    if args.allow_internal_format != "inherit":
+        torch.npu.config.allow_internal_format = args.allow_internal_format == "on"
     torch.manual_seed(args.seed)
     case_dir = args.output / "raw" / args.worker_case
     case_dir.mkdir(parents=True, exist_ok=False)
@@ -156,13 +194,14 @@ def capture_case(args):
                 block_shape=tuple(args.block_shape),
                 num_stages=args.num_stages,
                 transpose_weight_tile=args.transpose_weight_tile,
+                reuse_m=args.reuse_m,
             )
 
         def reference():
             return qbmm_reference(x, weight, sx, sw, torch.bfloat16)
 
-        expected = reference()
-        torch.testing.assert_close(fused(), expected, rtol=0, atol=0, equal_nan=False)
+        actual, expected = fused(), reference()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=False)
         function = fused if args.worker_case.startswith("triton") else reference
         for _ in range(args.warmup):
             function()
@@ -197,19 +236,29 @@ def capture_case(args):
             ),
             torch.profiler.record_function(args.worker_case),
         ):
-            run_profile_calls(function, graph, args.graph_batch_size, args.replays)
+            last_output = run_profile_calls(function, graph, args.graph_batch_size, args.replays)
             torch.npu.synchronize()
 
+        # Outside collection: verify the final profiled output as well as the
+        # pre-capture gate. This is not a check of every captured invocation.
+        torch.testing.assert_close(
+            captured if graph is not None else last_output, expected, rtol=0, atol=0, equal_nan=False
+        )
         metadata = {
             "case": args.worker_case,
             "strict_correctness": True,
             "shape_T_G_K_N": [args.tokens, groups, inner, columns],
             "weight_stride": list(weight.stride()),
+            "launch_options": launch_options(args),
+            "allow_internal_format": internal_format_enabled(torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT")),
+            "storage_formats": {"weight": torch_npu.get_npu_format(weight), "x": torch_npu.get_npu_format(x)},
+            "instrumentation": instrumentation,
             "torch": torch.__version__,
             "torch_npu": torch_npu.__version__,
             "operator_calls": args.graph_batch_size * args.replays,
             "input_scope": "prequantized; dynamic quantization and graph capture are outside profiling",
             "graph_output_checked": graph is not None,
+            "last_profiled_output_checked": True,
         }
         write_manifest(case_dir / "capture.json", metadata)
     return 0
@@ -274,8 +323,22 @@ def execute_case(args, output, case):
             raise ValueError(f"{name}: missing strict correctness confirmation")
         if metadata.get("operator_calls") != case["operator_calls"]:
             raise ValueError(f"{name}: unexpected operator call count")
+        if metadata.get("launch_options") != launch_options(args):
+            raise ValueError(f"{name}: worker used different launch parameters")
         case["capture"] = metadata
         case["artifacts"] = export_case(case_dir, output / "export", name)
+        # Read exactly one exported kernel CSV, never add op_summary again.
+        kernels = [item for item in case["artifacts"] if item["file"].endswith("kernel_details.csv")]
+        if len(kernels) != 1:
+            raise ValueError(f"{name}: expected one kernel_details.csv, found {len(kernels)}")
+        source = output / "export" / kernels[0]["file"]
+        aggregate, upstream = read_source(source)
+        focus = make_report(aggregate, source, 1, upstream, 3, name)
+        focus["capture"] = metadata
+        summary = output / "export" / f"{name}__pipeline_focus.json"
+        summary.write_text(serialize_bounded(focus, 32), encoding="utf-8")
+        summary.chmod(READABLE_FILE_MODE)
+        case["artifacts"].append({"file": summary.name, "bytes": summary.stat().st_size})
         case["status"] = "completed"
     except KeyboardInterrupt:
         case["status"] = "interrupted"
@@ -313,7 +376,7 @@ def main(argv=None):
         print(
             json.dumps(
                 {
-                    "parameters": {"block_shape": args.block_shape, "num_stages": args.num_stages},
+                    "parameters": launch_options(args),
                     "cases": case_plan(args),
                 },
                 indent=2,

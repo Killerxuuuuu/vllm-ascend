@@ -256,3 +256,35 @@ unset VLLM_ASCEND_DSV4_WO_A_TRITON
 ```
 
 不要在运行中的服务里切换开关。性能/精度对照应固定权重、TP/DP、输入、生成参数和输出长度，结果分别保存。
+
+## 5. 大 T 单算子流水 profiling
+
+不需要启动整网。同步根目录的 `profile_tqbmm.py` 和 `analyze_tqbmm_profile.py`，
+使用 vLLM 的基础 Python；先卸载已启用的 msMemScope API 注入，保持测试 NPU 独占。
+
+```bash
+python -u profile_tqbmm.py \
+  --quant-model "$QUANT_MODEL" --output "$PROFILE_OUTPUT" \
+  --device npu:0 --tokens 8192 --tp-size 8 --tp-rank 0 \
+  --block-shape 128 64 128 --num-stages 1 --reuse-m 2 \
+  --allow-internal-format on --reject-instrumentation \
+  --warmup 10 --graph-batch-size 4 --replays 4 \
+  --cases triton_eager triton_graph qbmm_eager qbmm_graph
+```
+
+默认 `reuse_m=1`，必须显式传 `--reuse-m 2` 才能测双 M 分块复用。
+固定分块，对照 `stages=1/2 × reuse_m=1/2`；原生参考不随这两个参数改变，可单独采集一次。
+`--allow-internal-format on` 与当前 `model_runner_v1.py` 的设置一致；采集元数据同时记录实际存储格式。
+新报告正确解析 `b"enable"/b"disable"`，修正旧 benchmark 用 `bool(bytes)` 把关闭状态也记为 true 的问题；
+旧报告的该布尔字段不能单独证明当时选项开启。
+参数、权重、seed 和 T 保持一致，先比较同模式下的 kernel 平均时长和 PMU 流水时间。
+
+采集范围是预量化 INT8 的 Wo_a 融合/拼接路径；动态量化、编译、预热和 Graph 捕获均不在采集区间。
+每个 case 在独立进程中串行采集，前置严格数值检查失败立即停止，不记录为有效性能结果。
+采集结束还检查最后一次输出，但不声称验证了每次 Graph 内的所有输出。
+
+输出的 `export/*__pipeline_focus.json` 自动保留 Kernel Duration 的均值、MTE2、MAC、MTE1、
+AIC Scalar、Fixpipe 和部分 AIV 时间，以及各指标覆盖的调用次数；缺失指标不填零。
+流水时间可重叠，不能相加或从总时间相减来计算空闲与等待。
+`export.tar.gz` 只包含分析文件、参数和日志，不含原始 PROF 数据或模型权重。
+profiler 存在测量开销，最终加速结论仍以关闭 profiler 的 benchmark 为准。
