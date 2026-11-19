@@ -14,18 +14,47 @@ import json
 import math
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import median
 
 from tools.dsv4_a3_wo.tune_tqbmm import (
-    Candidate,
+    ACTIVATION_SCRATCH_BYTES_PER_ELEMENT,
+    AUTOMATIC_PIPELINE_SCREEN_FACTOR,
+    EPILOGUE_SCRATCH_BYTES_PER_ELEMENT,
     WorkerFailure,
     run_worker,
     validate_exact_report,
     write_json,
 )
+from tools.dsv4_a3_wo.tune_tqbmm import (
+    Candidate as TileCandidate,
+)
+
+
+@dataclass(frozen=True)
+class Candidate(TileCandidate):
+    reuse_m: int = 1
+
+    @property
+    def tag(self):
+        return super().tag + (f"-rm{self.reuse_m}" if self.reuse_m != 1 else "")
+
+    def options(self):
+        return super().options() + (["--reuse-m", str(self.reuse_m)] if self.reuse_m != 1 else [])
+
+    @property
+    def estimated_ub_bytes(self):
+        # Two live A tiles / accumulators, one shared B tile. This remains a
+        # conservative heuristic, NOT a queried capacity or compiler allocation.
+        factor = AUTOMATIC_PIPELINE_SCREEN_FACTOR if self.num_stages == 2 else 1
+        extra = (self.reuse_m - 1) * (
+            ACTIVATION_SCRATCH_BYTES_PER_ELEMENT * self.block_m * self.block_k
+            + EPILOGUE_SCRATCH_BYTES_PER_ELEMENT * self.block_m * self.block_n
+        )
+        return super().estimated_ub_bytes + extra * factor
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TOKENS = (8, 32, 512, 1024, 4096, 7224, 8192)
@@ -55,14 +84,20 @@ def build_candidates(args):
     )
     if args.tile_loads == "both":
         choices += [Candidate(c.block_m, c.block_n, c.block_k, c.num_stages, True) for c in tuple(choices)]
-    for c in choices:
+    choices = [
+        Candidate(c.block_m, c.block_n, c.block_k, c.num_stages, c.transpose_weight_tile, reuse_m)
+        for c in choices
+        for reuse_m in args.reuse_m
+    ]
+    control = Candidate(*args.control)
+    for c in [control, *choices]:
         if any(v < 16 or v > MAX_TILE_SIZE or v & (v - 1) for v in (c.block_m, c.block_n, c.block_k)):
             raise ValueError("Tile sizes must be powers of two between 16 and 128")
         if c.block_k < 32 or c.num_stages not in (1, 2):
             raise ValueError("K tile must be >=32, stages must be 1 or 2")
         if c.block_n >= 128 and c.block_k >= 128:
             raise ValueError("N>=128 with K>=128 remains excluded after historical UB overflow")
-    choices = list(dict.fromkeys([CURRENT, *choices]))
+    choices = list(dict.fromkeys([control, *choices]))
     if len(choices) > MAX_CANDIDATES:
         raise ValueError(f"At most {MAX_CANDIDATES} candidates may be tested")
     return choices
@@ -83,6 +118,8 @@ def parse_args(argv=None):
     parser.add_argument("--search-space", choices=("focused", "wide"), default="focused")
     parser.add_argument("--candidate", nargs=4, type=int, action="append", metavar=("M", "N", "K", "STAGES"))
     parser.add_argument("--tile-loads", choices=("direct", "both"), default="direct")
+    parser.add_argument("--reuse-m", type=int, nargs="+", choices=(1, 2), default=[1])
+    parser.add_argument("--control", type=int, nargs=4, default=[64, 64, 128, 2], metavar=("M", "N", "K", "STAGES"))
     parser.add_argument("--top-k", type=int, default=3, help="Non-control finalists selected by screening")
     parser.add_argument("--selection-mode", choices=("eager", "graph"), default="eager")
     parser.add_argument("--objective", choices=("including_quant", "prequantized"), default="including_quant")
@@ -179,6 +216,8 @@ def validate_measurement(report, args, candidate, tokens, expected_format=None):
         raise ValueError("Worker stages differ")
     if report.get("transpose_weight_tile") != candidate.transpose_weight_tile:
         raise ValueError("Worker tile-load mode differs")
+    if report.get("reuse_m", 1) != candidate.reuse_m:
+        raise ValueError("Worker M-tile reuse differs")
     if report.get("prepared_dynamic") is not True:
         raise ValueError("Worker did not use the server's PreparedDynamicWoA path")
     if "allow_internal_format" not in report:
@@ -261,7 +300,7 @@ def build_recommendations(report):
         "run_status": report["run_status"],
         "objective": settings["objective"],
         "effective_internal_format": report.get("effective_internal_format"),
-        "baseline_candidate": CURRENT.tag,
+        "baseline_candidate": report["results"][0]["tag"],
         "by_T_and_mode": per_shape,
         "production_dispatch_applied": False,
         "note": (
@@ -351,6 +390,8 @@ def trial(args, output, report, result, candidate, phase, tokens=None, seed=0, g
         if gate:
             if r[gate] != "passed":
                 raise ValueError(f"Correctness gate failed: {gate}")
+            if r.get("reuse_m", 1) != candidate.reuse_m:
+                raise ValueError("Correctness gate used a different reuse_m")
         else:
             validate_measurement(r, args, candidate, tokens, report.get("effective_internal_format"))
             report["effective_internal_format"] = r["allow_internal_format"]
@@ -426,6 +467,7 @@ def main(argv=None):
         "tools/dsv4_a3_wo/benchmark_tqbmm.py",
         "vllm_ascend/ops/triton/transpose_quant_batch_matmul.py",
         "vllm_ascend/attention/dsa_v1.py",
+        "autotune_tqbmm_reuse.py",
     )
     report = {
         "schema_version": 1,
@@ -453,7 +495,7 @@ def main(argv=None):
     code = 0
     try:
         baseline = report["results"][0]
-        evaluate(args, output, report, baseline, CURRENT, "verify", args.tokens, args.seeds)
+        evaluate(args, output, report, baseline, choices[0], "verify", args.tokens, args.seeds)
         if baseline["verification_status"] != "passed":
             report["run_status"] = "baseline_failed"
             return 1

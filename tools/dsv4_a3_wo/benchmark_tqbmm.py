@@ -59,6 +59,7 @@ def check_weight_layouts(args):
                     block_shape=block_shape,
                     num_stages=args.num_stages,
                     transpose_weight_tile=args.transpose_weight_tile,
+                    reuse_m=getattr(args, "reuse_m", 1),
                 ).cpu()
                 diff = (actual - expected).abs()
                 # Diagnostic only: both tensors are now on CPU, outside timing.
@@ -77,7 +78,12 @@ def check_weight_layouts(args):
                 print(json.dumps(case), flush=True)
     if any(case["mismatch"] for case in results):
         raise AssertionError("Layout regression failed; do not run timing, profiling or full-model validation")
-    return {"layout_check": "passed", "cases": len(results), "num_stages": args.num_stages}
+    return {
+        "layout_check": "passed",
+        "cases": len(results),
+        "num_stages": args.num_stages,
+        "reuse_m": getattr(args, "reuse_m", 1),
+    }
 
 
 @torch.inference_mode()
@@ -132,6 +138,7 @@ def check_k_loop(args):
             block_shape=block_shape,
             num_stages=args.num_stages,
             transpose_weight_tile=args.transpose_weight_tile,
+            reuse_m=getattr(args, "reuse_m", 1),
         ).cpu()
         diff = (actual - expected).abs()
         case = {
@@ -149,7 +156,12 @@ def check_k_loop(args):
         results.append(case)
     if any(case["mismatch"] for case in results):
         raise AssertionError("K-loop/pitch isolation failed; retain all seven case reports")
-    return {"k_loop_check": "passed", "cases": len(results), "num_stages": args.num_stages}
+    return {
+        "k_loop_check": "passed",
+        "cases": len(results),
+        "num_stages": args.num_stages,
+        "reuse_m": getattr(args, "reuse_m", 1),
+    }
 
 
 def qbmm_reference(x, weight, sx, sw, output_dtype):
@@ -313,6 +325,7 @@ def run(args):
     x = x.view_as(activations)
     sx = sx.reshape(args.tokens, groups).float()
     block_shape = tuple(args.block_shape) if args.block_shape else None
+    reuse_m = getattr(args, "reuse_m", 1)
 
     def fused():
         return transpose_quant_batch_matmul(
@@ -323,6 +336,7 @@ def run(args):
             block_shape=block_shape,
             num_stages=args.num_stages,
             transpose_weight_tile=args.transpose_weight_tile,
+            reuse_m=reuse_m,
         )
 
     def reference():
@@ -336,6 +350,7 @@ def run(args):
             block_shape=block_shape,
             num_stages=args.num_stages,
             transpose_weight_tile=args.transpose_weight_tile,
+            reuse_m=reuse_m,
         )
         if prepared_dynamic
         else None
@@ -351,6 +366,7 @@ def run(args):
             block_shape=block_shape,
             num_stages=args.num_stages,
             transpose_weight_tile=args.transpose_weight_tile,
+            reuse_m=reuse_m,
         )
 
     actual, expected = fused(), reference()
@@ -373,6 +389,7 @@ def run(args):
             "quantized_activation": torch_npu.get_npu_format(x),
         },
         "prepared_dynamic": prepared_dynamic,
+        "reuse_m": reuse_m,
         "instrumentation": instrumentation,
         "num_stages": args.num_stages,
         "requested_block_shape": block_shape,
@@ -426,6 +443,9 @@ def parse_args():
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--allow-internal-format", choices=("inherit", "on", "off"), default="inherit")
     parser.add_argument("--prepared-dynamic", action="store_true", help="Use the server's PreparedDynamicWoA path")
+    parser.add_argument(
+        "--reuse-m", type=int, choices=(1, 2), default=1, help="Experimental B-tile reuse across M tiles"
+    )
     parser.add_argument("--reject-instrumentation", action="store_true", help="Reject detected msMemScope injection")
     parser.add_argument("--quant-model", type=Path)
     parser.add_argument("--layer", type=int, default=0)

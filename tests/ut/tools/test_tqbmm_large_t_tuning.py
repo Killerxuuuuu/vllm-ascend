@@ -40,6 +40,7 @@ def measurement(args, candidate, tokens, triton=0.2, native=0.3):
         "requested_block_shape": [candidate.block_m, candidate.block_n, candidate.block_k],
         "num_stages": candidate.num_stages,
         "transpose_weight_tile": candidate.transpose_weight_tile,
+        "reuse_m": candidate.reuse_m,
         "prepared_dynamic": True,
         "allow_internal_format": True,
         "instrumentation": {"memscope_modules": [], "preload_hooks": []},
@@ -129,6 +130,7 @@ def test_worker_command_is_explicit_and_matches_prepared_server_path():
     [
         "shape",
         "source",
+        "reuse",
         "tile",
         "stage",
         "load_mode",
@@ -147,6 +149,8 @@ def test_validation_rejects_wrong_inexact_or_uncontrolled_reports(mutation):
         r["shape_T_G_K_N"][1] = 8
     elif mutation == "source":
         r["benchmark_source"] = "another_checkout/benchmark.py"
+    elif mutation == "reuse":
+        r["reuse_m"] = 2
     elif mutation == "tile":
         r["requested_block_shape"] = [16, 32, 32]
     elif mutation == "stage":
@@ -207,12 +211,14 @@ def worker_fixture(options, fail=None):
     args = large.parse_args(options)
 
     def worker(command, log, timeout, key):
+        reuse_m = int(command[command.index("--reuse-m") + 1]) if "--reuse-m" in command else 1
         if key in ("layout_check", "k_loop_check"):
-            return {key: "passed"}
+            return {key: "passed", "reuse_m": reuse_m}
         candidate = large.Candidate(
             *map(int, command[command.index("--block-shape") + 1 : command.index("--block-shape") + 4]),
             int(command[command.index("--num-stages") + 1]),
             "--transpose-weight-tile" in command,
+            reuse_m,
         )
         tokens = int(command[command.index("--tokens") + 1])
         seed = int(command[command.index("--seed") + 1])
@@ -349,3 +355,51 @@ def test_benchmark_uses_prepared_plan_for_correctness_capture_and_timing():
     assert "dynamic_actual = dynamic_fused()" in text
     assert "captured = dynamic_fused()" in text
     assert "'triton_including_quant': dynamic_fused" in text
+
+
+def test_reuse_plan_contains_matched_legacy_and_paired_tiles_with_measured_control():
+    args = arguments("--reuse-m", "1", "2", "--control", "128", "64", "128", "2")
+    choices = large.build_candidates(args)
+    assert choices[0] == large.Candidate(128, 64, 128, 2)
+    assert len(choices) == 28
+    for candidate in choices:
+        assert candidate.reuse_m in (1, 2)
+        assert (
+            large.Candidate(
+                candidate.block_m,
+                candidate.block_n,
+                candidate.block_k,
+                candidate.num_stages,
+                candidate.transpose_weight_tile,
+                3 - candidate.reuse_m,
+            )
+            in choices
+        )
+    paired = large.Candidate(64, 64, 128, 2, reuse_m=2)
+    assert paired.tag.endswith("-rm2")
+    assert paired.options()[-2:] == ["--reuse-m", "2"]
+
+
+def test_reuse_root_dry_run_uses_the_new_measured_large_t_control():
+    process = subprocess.run(
+        [sys.executable, str(large.REPO_ROOT / "autotune_tqbmm_reuse.py"), "--quant-model", "unused", "--dry-run"],
+        cwd=large.REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    report = json.loads(process.stdout)
+    assert report["candidates"][0]["tag"] == "m128n64k128s2"
+    assert report["settings"]["screen_tokens"] == [1024, 8192]
+    assert len(report["candidates"]) == 28
+
+
+def test_reuse_candidates_use_exact_gates_and_are_verified_normally(tmp_path):
+    options = run_options(tmp_path, "--reuse-m", "1", "2")
+    with patch.object(large, "run_worker", side_effect=worker_fixture(options)):
+        assert large.main(options) == 0
+    report = json.loads((tmp_path / "scan" / "results.json").read_text())
+    paired = next(r for r in report["results"] if r["tag"].endswith("-rm2"))
+    assert paired["gate_status"] == "passed"
+    assert paired["verification_status"] == "passed"
+    assert all(t["report"]["reuse_m"] == 2 for t in paired["trials"])

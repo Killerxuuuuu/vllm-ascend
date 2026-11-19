@@ -71,6 +71,9 @@ class Tensor:
         )
 
     def view(self, *shape):
+        if -1 in shape:
+            inferred = self.numel() // math.prod(size for size in shape if size != -1)
+            shape = tuple(inferred if size == -1 else size for size in shape)
         return Tensor(shape, self.dtype, self._storage, device=self.device, fmt=self.fmt)
 
     def reshape(self, *shape):
@@ -158,6 +161,44 @@ def inputs(backend, tokens=17):
     )
 
 
+@pytest.mark.parametrize("kind", ["safe", "fixed", "dynamic", "dynamic_safe"])
+def test_paired_m_launch_wiring_for_all_entry_points(host, kind):
+    module, backend = host
+    x, weight, sx, sw = inputs(backend, tokens=129)
+    options = {"block_shape": (64, 32, 32), "reuse_m": 2}
+    if kind == "safe":
+        result = module.transpose_quant_batch_matmul(x, weight, sx, sw, **options)
+    elif kind == "fixed":
+        plan = module.PreparedTQBMM(x, weight, sx, sw, **options)
+        result = plan()
+    else:
+        activations = backend.tensor(x.shape, "bf16")
+        if kind == "dynamic":
+            plan = module.PreparedDynamicWoA(weight, sw, **options)
+            result = plan(activations)
+            assert plan._reuse_m == 2
+        else:
+            result = module.dynamic_quant_grouped_wo_a(activations, weight, sw, **options)
+    assert result.shape == (129, 2, 33)
+    assert backend.launches[-1][0] == (4, 2)
+    assert backend.launches[-1][2]["REUSE_M"] == 2
+
+
+@pytest.mark.parametrize("reuse_m", [0, 3, True, 2.0, "2", None])
+@pytest.mark.parametrize("kind", ["safe", "fixed", "dynamic"])
+def test_invalid_reuse_rejected_without_launch(host, reuse_m, kind):
+    module, backend = host
+    x, weight, sx, sw = inputs(backend)
+    with pytest.raises(ValueError, match="reuse_m"):
+        if kind == "safe":
+            module.transpose_quant_batch_matmul(x, weight, sx, sw, reuse_m=reuse_m)
+        elif kind == "fixed":
+            module.PreparedTQBMM(x, weight, sx, sw, reuse_m=reuse_m)
+        else:
+            module.PreparedDynamicWoA(weight, sw, reuse_m=reuse_m)
+    assert not backend.launches
+
+
 def test_safe_out_returns_supplied_tensor_and_keeps_validation(host):
     module, backend = host
     tensors = inputs(backend)
@@ -237,6 +278,7 @@ def test_prepared_caches_geometry_but_keeps_shared_values_alive(host):
         "BLOCK_K": 128,
         "GROUP_SIZE_M": 4,
         "TRANSPOSE_WEIGHT_TILE": False,
+        "REUSE_M": 1,
         "num_stages": 2,
     }
     with pytest.raises(FrozenInstanceError):
