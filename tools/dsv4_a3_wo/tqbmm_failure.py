@@ -23,7 +23,7 @@ def finite_value(value):
     return value if math.isfinite(value) else str(value)
 
 
-def summarize_failure(*, x, weight, sx, sw, actual, native, block_shape, reuse_m, output_cast):
+def summarize_failure(*, x, weight, sx, sw, actual, native, block_shape, reuse_m, output_cast, reuse_n=1):
     """Arrays are CPU NumPy snapshots; output_cast must also run on CPU."""
     tokens, groups, columns = actual.shape
     block_m, block_n, _ = block_shape
@@ -54,6 +54,8 @@ def summarize_failure(*, x, weight, sx, sw, actual, native, block_shape, reuse_m
                 "position": [t, g, n],
                 "M_pair": t // (block_m * reuse_m),
                 "accumulator": (t // block_m) % reuse_m,
+                "N_pair": n // (block_n * reuse_n),
+                "N_accumulator": (n // block_n) % reuse_n,
                 "cpu_integer_sum": integer,
                 "cpu_scaled_fp32": finite_value(scaled),
                 "cpu_output": finite_value(golden),
@@ -107,6 +109,7 @@ def dump_failure(*, args, x, weight, sx, sw, actual, native, torch_module):
         native=cpu["native"].float().numpy(),
         block_shape=tuple(shape),
         reuse_m=args.reuse_m,
+        reuse_n=getattr(args, "reuse_n", 1),
         output_cast=lambda value: (
             torch_module.tensor(value, dtype=torch_module.float32, device="cpu").to(actual.dtype).item()
         ),

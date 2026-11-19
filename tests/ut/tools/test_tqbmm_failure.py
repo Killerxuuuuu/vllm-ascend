@@ -88,6 +88,15 @@ def test_matching_outputs_need_no_golden_samples():
     assert report["cpu_golden_points"] == []
 
 
+def test_failure_points_identify_second_n_accumulator():
+    case = example()
+    case["actual"][3, 1, 4] += 100
+    report = summarize_failure(**case, reuse_n=2)
+    point = report["cpu_golden_points"][0]
+    assert point["accumulator"] == point["N_accumulator"] == 1
+    assert point["N_pair"] == 0
+
+
 def comparison_fragment():
     tree = ast.parse(BENCHMARK.read_text(encoding="utf-8"))
     run = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "run")

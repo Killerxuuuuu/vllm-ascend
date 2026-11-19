@@ -73,6 +73,7 @@ def test_defaults_and_equal_call_counts():
     assert args.block_shape == [64, 64, 128]
     assert args.num_stages == 2
     assert args.reuse_m == 1
+    assert args.reuse_n == 1
     assert args.allow_internal_format == "inherit"
     assert not args.transpose_weight_tile
     plan = profiling.case_plan(args)
@@ -97,6 +98,7 @@ def test_defaults_and_equal_call_counts():
         ["--block-shape", "16", "32", "16"],
         ["--num-stages", "3"],
         ["--reuse-m", "3"],
+        ["--reuse-n", "3"],
         ["--allow-internal-format", "invalid"],
         ["--worker-case", "triton_graph"],
     ],
@@ -136,6 +138,8 @@ def test_worker_command_forwards_options(tmp_path):
             "1",
             "--reuse-m",
             "2",
+            "--reuse-n",
+            "2",
             "--allow-internal-format",
             "on",
             "--reject-instrumentation",
@@ -161,6 +165,7 @@ def test_worker_command_forwards_options(tmp_path):
     assert (forwarded.replays, forwarded.graph_batch_size) == (3, 8)
     assert forwarded.transpose_weight_tile
     assert forwarded.reuse_m == 2
+    assert forwarded.reuse_n == 2
     assert forwarded.allow_internal_format == "on"
     assert forwarded.reject_instrumentation
 
@@ -178,6 +183,7 @@ def test_capture_passes_reuse_m_to_the_actual_kernel():
     assert len(calls) == 1
     options = {keyword.arg: ast.unparse(keyword.value) for keyword in calls[0].keywords}
     assert options["reuse_m"] == "args.reuse_m"
+    assert options["reuse_n"] == "args.reuse_n"
     assert options["num_stages"] == "args.num_stages"
 
 

@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -41,6 +42,7 @@ def measurement(args, candidate, tokens, triton=0.2, native=0.3):
         "num_stages": candidate.num_stages,
         "transpose_weight_tile": candidate.transpose_weight_tile,
         "reuse_m": candidate.reuse_m,
+        "reuse_n": candidate.reuse_n,
         "prepared_dynamic": True,
         "allow_internal_format": True,
         "instrumentation": {"memscope_modules": [], "preload_hooks": []},
@@ -131,6 +133,7 @@ def test_worker_command_is_explicit_and_matches_prepared_server_path():
         "shape",
         "source",
         "reuse",
+        "reuse_n",
         "tile",
         "stage",
         "load_mode",
@@ -151,6 +154,8 @@ def test_validation_rejects_wrong_inexact_or_uncontrolled_reports(mutation):
         r["benchmark_source"] = "another_checkout/benchmark.py"
     elif mutation == "reuse":
         r["reuse_m"] = 2
+    elif mutation == "reuse_n":
+        r["reuse_n"] = 2
     elif mutation == "tile":
         r["requested_block_shape"] = [16, 32, 32]
     elif mutation == "stage":
@@ -212,13 +217,15 @@ def worker_fixture(options, fail=None):
 
     def worker(command, log, timeout, key):
         reuse_m = int(command[command.index("--reuse-m") + 1]) if "--reuse-m" in command else 1
+        reuse_n = int(command[command.index("--reuse-n") + 1]) if "--reuse-n" in command else 1
         if key in ("layout_check", "k_loop_check"):
-            return {key: "passed", "reuse_m": reuse_m}
+            return {key: "passed", "reuse_m": reuse_m, "reuse_n": reuse_n}
         candidate = large.Candidate(
             *map(int, command[command.index("--block-shape") + 1 : command.index("--block-shape") + 4]),
             int(command[command.index("--num-stages") + 1]),
             "--transpose-weight-tile" in command,
             reuse_m,
+            reuse_n,
         )
         tokens = int(command[command.index("--tokens") + 1])
         seed = int(command[command.index("--seed") + 1])
@@ -403,3 +410,39 @@ def test_reuse_candidates_use_exact_gates_and_are_verified_normally(tmp_path):
     assert paired["gate_status"] == "passed"
     assert paired["verification_status"] == "passed"
     assert all(t["report"]["reuse_m"] == 2 for t in paired["trials"])
+
+
+def test_data_reuse_entry_has_matched_ablation_and_wider_n():
+    process = subprocess.run(
+        [sys.executable, str(large.REPO_ROOT / "autotune_tqbmm_data_reuse.py"), "--quant-model", "unused", "--dry-run"],
+        cwd=large.REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    plan = json.loads(process.stdout)
+    assert len(plan["candidates"]) == 32
+    assert plan["settings"]["allow_internal_format"] == "on"
+    assert any(c["block_n"] == 128 for c in plan["candidates"])
+    assert any(c["reuse_m"] == c["reuse_n"] == 2 for c in plan["candidates"])
+    assert all(not (c["block_n"] >= 128 and c["block_k"] >= 128) for c in plan["candidates"])
+
+
+def test_n_reuse_reaches_workers_and_recommendations(tmp_path):
+    options = run_options(tmp_path, "--reuse-n", "2")
+    with patch.object(large, "run_worker", side_effect=worker_fixture(options)):
+        assert large.main(options) == 0
+    report = json.loads((tmp_path / "scan" / "results.json").read_text())
+    assert any(r["parameters"]["reuse_n"] == 2 and r["verification_status"] == "passed" for r in report["results"])
+
+
+@pytest.mark.parametrize("reuse_m", [1, 2])
+def test_n_reuse_cpu_gates_really_exercise_second_tiles(reuse_m):
+    tree = ast.parse((large.REPO_ROOT / "tools/dsv4_a3_wo/benchmark_tqbmm.py").read_text(encoding="utf-8"))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "layout_check_shape")
+    namespace = {"LAYOUT_CHECK_TOKENS": 16, "LAYOUT_CHECK_COLUMNS": 32}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "gate_shape", "exec"), namespace)
+    args = SimpleNamespace(block_shape=(128, 128, 64), reuse_m=reuse_m, reuse_n=2)
+    assert namespace["layout_check_shape"](args) == (128 * reuse_m + 1, 257)
+    args.reuse_n = 1
+    assert namespace["layout_check_shape"](args) == (16, 32)

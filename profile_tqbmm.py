@@ -45,6 +45,7 @@ def parse_args(argv=None):
     parser.add_argument("--block-shape", type=int, nargs=3, default=[64, 64, 128], metavar=("M", "N", "K"))
     parser.add_argument("--num-stages", type=int, choices=(1, 2), default=2)
     parser.add_argument("--reuse-m", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--reuse-n", type=int, choices=(1, 2), default=1)
     parser.add_argument("--allow-internal-format", choices=("inherit", "on", "off"), default="inherit")
     parser.add_argument("--reject-instrumentation", action="store_true", help="Reject detected msMemScope hooks")
     parser.add_argument("--transpose-weight-tile", action="store_true")
@@ -88,6 +89,7 @@ def launch_options(args):
         "block_shape": args.block_shape,
         "num_stages": args.num_stages,
         "reuse_m": args.reuse_m,
+        "reuse_n": args.reuse_n,
         "transpose_weight_tile": args.transpose_weight_tile,
     }
 
@@ -121,6 +123,8 @@ def worker_command(args, name, output):
         str(args.num_stages),
         "--reuse-m",
         str(args.reuse_m),
+        "--reuse-n",
+        str(args.reuse_n),
         "--allow-internal-format",
         args.allow_internal_format,
         "--warmup",
@@ -195,6 +199,7 @@ def capture_case(args):
                 num_stages=args.num_stages,
                 transpose_weight_tile=args.transpose_weight_tile,
                 reuse_m=args.reuse_m,
+                reuse_n=args.reuse_n,
             )
 
         def reference():

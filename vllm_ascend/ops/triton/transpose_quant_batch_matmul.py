@@ -48,6 +48,7 @@ def _transpose_quant_batch_matmul_kernel(
     GROUP_SIZE_M: tl.constexpr,
     TRANSPOSE_WEIGHT_TILE: tl.constexpr = False,
     REUSE_M: tl.constexpr = 1,
+    REUSE_N: tl.constexpr = 1,
 ):
     # Group nearby M tiles when traversing N, improving weight cache locality.
     pid = tl.program_id(0)
@@ -55,7 +56,7 @@ def _transpose_quant_batch_matmul_kernel(
     # Experimental paired-M scheduling: one B tile feeds two independent
     # accumulators. REUSE_M=1 retains the established single-tile path.
     num_m = tl.cdiv(T, BLOCK_M * REUSE_M)
-    num_n = tl.cdiv(N, BLOCK_N)
+    num_n = tl.cdiv(N, BLOCK_N * REUSE_N)
     window = GROUP_SIZE_M * num_n
     window_id = pid // window
     first_m = window_id * GROUP_SIZE_M
@@ -64,12 +65,17 @@ def _transpose_quant_batch_matmul_kernel(
     pid_n = (pid % window) // active_m
 
     rows = (pid_m * BLOCK_M * REUSE_M + tl.arange(0, BLOCK_M)).to(tl.int64)
-    cols = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
+    cols = (pid_n * BLOCK_N * REUSE_N + tl.arange(0, BLOCK_N)).to(tl.int64)
     inner = tl.arange(0, BLOCK_K).to(tl.int64)
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
     if REUSE_M == 2:
         rows_second = rows + BLOCK_M
         accumulator_second = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    if REUSE_N == 2:
+        cols_second = cols + BLOCK_N
+        accumulator_n = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+        if REUSE_M == 2:
+            accumulator_mn = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
     for step in range(tl.cdiv(K, BLOCK_K)):
         # Reconstruct addresses from the immutable bases, not loop-carried
         # pointer tensors. The same absolute K indices drive loads and masks.
@@ -90,6 +96,18 @@ def _transpose_quant_batch_matmul_kernel(
             w = w_ptr + group * stride_wg + current_k[:, None] * stride_wk + cols[None, :] * stride_wn
             a = tl.load(x, mask=(rows[:, None] < T) & (current_k[None, :] < K), other=0)
             b = tl.load(w, mask=(current_k[:, None] < K) & (cols[None, :] < N), other=0)
+        if REUSE_N == 2:
+            # One A load feeds both N tiles. Each B tile is loaded once and
+            # feeds both M tiles when REUSE_M=2. All addresses remain absolute.
+            if TRANSPOSE_WEIGHT_TILE:
+                w_nk_second = (
+                    w_ptr + group * stride_wg + cols_second[:, None] * stride_wn + current_k[None, :] * stride_wk
+                )
+                b_nk_second = tl.load(w_nk_second, mask=(cols_second[:, None] < N) & (current_k[None, :] < K), other=0)
+                b_second = tl.trans(b_nk_second)
+            else:
+                w_second = w_ptr + group * stride_wg + current_k[:, None] * stride_wk + cols_second[None, :] * stride_wn
+                b_second = tl.load(w_second, mask=(current_k[:, None] < K) & (cols_second[None, :] < N), other=0)
         if REUSE_M == 2:
             # Immutable base + absolute K, including strided views and tails.
             # Do not reload b here: its SSA value is shared by both dots.
@@ -98,6 +116,10 @@ def _transpose_quant_batch_matmul_kernel(
         accumulator = tl.dot(a, b, accumulator, out_dtype=tl.int32)
         if REUSE_M == 2:
             accumulator_second = tl.dot(a_second, b, accumulator_second, out_dtype=tl.int32)
+        if REUSE_N == 2:
+            accumulator_n = tl.dot(a, b_second, accumulator_n, out_dtype=tl.int32)
+            if REUSE_M == 2:
+                accumulator_mn = tl.dot(a_second, b_second, accumulator_mn, out_dtype=tl.int32)
 
     sx = tl.load(sx_ptr + rows * stride_sxt + group * stride_sxg, mask=rows < T, other=0)
     sw = tl.load(sw_ptr + group * stride_swg + cols * stride_swn, mask=cols < N, other=0)
@@ -114,6 +136,19 @@ def _transpose_quant_batch_matmul_kernel(
             result_second.to(y_ptr.dtype.element_ty),
             mask=(rows_second[:, None] < T) & (cols[None, :] < N),
         )
+    if REUSE_N == 2:
+        sw_second = tl.load(sw_ptr + group * stride_swg + cols_second * stride_swn, mask=cols_second < N, other=0)
+        result_n = (accumulator_n.to(tl.float32) * sw_second[None, :]) * sx[:, None]
+        y_n = y_ptr + (rows[:, None] * G + group) * N + cols_second[None, :]
+        tl.store(y_n, result_n.to(y_ptr.dtype.element_ty), mask=(rows[:, None] < T) & (cols_second[None, :] < N))
+        if REUSE_M == 2:
+            result_mn = (accumulator_mn.to(tl.float32) * sw_second[None, :]) * sx_second[:, None]
+            y_mn = y_ptr + (rows_second[:, None] * G + group) * N + cols_second[None, :]
+            tl.store(
+                y_mn,
+                result_mn.to(y_ptr.dtype.element_ty),
+                mask=(rows_second[:, None] < T) & (cols_second[None, :] < N),
+            )
 
 
 def _validate_inputs(x, weight, x_scale, weight_scale, output_dtype):
@@ -143,10 +178,12 @@ def _validate_num_stages(num_stages):
         raise ValueError("num_stages must be 1 (disable auto multi-buffering) or 2 (automatic mode)")
 
 
-def _resolve_launch_options(tokens, block_shape, num_stages, transpose_weight_tile, reuse_m=1):
+def _resolve_launch_options(tokens, block_shape, num_stages, transpose_weight_tile, reuse_m=1, reuse_n=1):
     _validate_num_stages(num_stages)
     if type(reuse_m) is not int or reuse_m not in (1, 2):
         raise ValueError("reuse_m must be 1 (legacy) or 2 (experimental paired M tiles)")
+    if type(reuse_n) is not int or reuse_n not in (1, 2):
+        raise ValueError("reuse_n must be 1 (legacy) or 2 (experimental paired N tiles)")
     if type(transpose_weight_tile) is not bool:
         raise TypeError("transpose_weight_tile must be a bool")
     if block_shape is None:
@@ -195,6 +232,7 @@ def transpose_quant_batch_matmul(
     transpose_weight_tile: bool = False,
     out: torch.Tensor | None = None,
     reuse_m: int = 1,
+    reuse_n: int = 1,
 ) -> torch.Tensor:
     """INT8 matmul with per-token-per-group / per-group-per-channel scales.
 
@@ -215,13 +253,18 @@ def transpose_quant_batch_matmul(
     ``reuse_m=2`` experimentally shares one B load between two M tiles. It
     doubles live accumulators, not the per-dot BLOCK_M; device validation is
     required. It does not promise explicit L1 residency or A5-equivalent DMA.
+    ``reuse_n=2`` shares each A tile between two N tiles; combining both reuse
+    axes holds four independent accumulators. No global packing or intermediate
+    output is added. L1/L0 placement and DMA scheduling remain compiler-managed.
     """
     _validate_inputs(x, weight, x_scale, weight_scale, output_dtype)
     if x.device.type != "npu":
         raise ValueError("TQBMM is an Ascend NPU kernel; run it on A3")
     tokens, groups, inner = x.shape
     columns = weight.shape[-1]
-    block_m, block_n, block_k = _resolve_launch_options(tokens, block_shape, num_stages, transpose_weight_tile, reuse_m)
+    block_m, block_n, block_k = _resolve_launch_options(
+        tokens, block_shape, num_stages, transpose_weight_tile, reuse_m, reuse_n
+    )
     if out is None:
         output = torch.empty((tokens, groups, columns), dtype=output_dtype, device=x.device)
     else:
@@ -231,7 +274,7 @@ def transpose_quant_batch_matmul(
         return output
     if any(torch_npu.get_npu_format(tensor) not in (0, 2) for tensor in (x, weight, x_scale, weight_scale)):
         raise ValueError("TQBMM requires ND storage; NZ is not supported")
-    grid = (triton.cdiv(tokens, block_m * reuse_m) * triton.cdiv(columns, block_n), groups)
+    grid = (triton.cdiv(tokens, block_m * reuse_m) * triton.cdiv(columns, block_n * reuse_n), groups)
     _transpose_quant_batch_matmul_kernel[grid](
         x,
         weight,
@@ -252,6 +295,7 @@ def transpose_quant_batch_matmul(
         GROUP_SIZE_M=DEFAULT_GROUP_SIZE_M,
         TRANSPOSE_WEIGHT_TILE=transpose_weight_tile,
         REUSE_M=reuse_m,
+        REUSE_N=reuse_n,
         num_stages=num_stages,
     )
     return output
@@ -283,6 +327,7 @@ class PreparedTQBMM:
     _num_stages: int
     _transpose_weight_tile: bool
     _reuse_m: int
+    _reuse_n: int
     _empty: bool
 
     def __init__(
@@ -298,13 +343,14 @@ class PreparedTQBMM:
         transpose_weight_tile=False,
         out=None,
         reuse_m=1,
+        reuse_n=1,
     ):
         _validate_inputs(x, weight, x_scale, weight_scale, output_dtype)
         if x.device.type != "npu":
             raise ValueError("TQBMM is an Ascend NPU kernel; run it on A3")
         tokens, groups, inner = x.shape
         columns = weight.shape[-1]
-        block_shape = _resolve_launch_options(tokens, block_shape, num_stages, transpose_weight_tile, reuse_m)
+        block_shape = _resolve_launch_options(tokens, block_shape, num_stages, transpose_weight_tile, reuse_m, reuse_n)
         inputs = (x, weight, x_scale, weight_scale)
         if any(torch_npu.get_npu_format(tensor) not in (0, 2) for tensor in inputs):
             raise ValueError("TQBMM requires ND storage; NZ is not supported")
@@ -334,7 +380,7 @@ class PreparedTQBMM:
             self,
             "_grid",
             (
-                triton.cdiv(tokens, block_shape[0] * reuse_m) * triton.cdiv(columns, block_shape[1]),
+                triton.cdiv(tokens, block_shape[0] * reuse_m) * triton.cdiv(columns, block_shape[1] * reuse_n),
                 groups,
             ),
         )
@@ -342,6 +388,7 @@ class PreparedTQBMM:
         object.__setattr__(self, "_num_stages", num_stages)
         object.__setattr__(self, "_transpose_weight_tile", transpose_weight_tile)
         object.__setattr__(self, "_reuse_m", reuse_m)
+        object.__setattr__(self, "_reuse_n", reuse_n)
         object.__setattr__(self, "_empty", tokens == 0)
 
     def __call__(self):
@@ -354,6 +401,7 @@ class PreparedTQBMM:
                 GROUP_SIZE_M=DEFAULT_GROUP_SIZE_M,
                 TRANSPOSE_WEIGHT_TILE=self._transpose_weight_tile,
                 REUSE_M=self._reuse_m,
+                REUSE_N=self._reuse_n,
                 num_stages=self._num_stages,
             )
         return self.output
@@ -381,8 +429,19 @@ class PreparedDynamicWoA:
     _num_stages: int
     _transpose_weight_tile: bool
     _reuse_m: int
+    _reuse_n: int
 
-    def __init__(self, weight, weight_scale, *, block_shape=None, num_stages=1, transpose_weight_tile=False, reuse_m=1):
+    def __init__(
+        self,
+        weight,
+        weight_scale,
+        *,
+        block_shape=None,
+        num_stages=1,
+        transpose_weight_tile=False,
+        reuse_m=1,
+        reuse_n=1,
+    ):
         if weight.ndim != 3 or weight.dtype != torch.int8:
             raise ValueError("Prepared Wo_a requires INT8 weight=[G,K,N]")
         groups, inner, columns = weight.shape
@@ -394,7 +453,7 @@ class PreparedDynamicWoA:
             raise ValueError("Prepared Wo_a requires one scale per output channel")
         if weight_scale.dtype not in (torch.bfloat16, torch.float16, torch.float32):
             raise TypeError("Prepared Wo_a requires floating-point weight scales")
-        block_shape = _resolve_launch_options(0, block_shape, num_stages, transpose_weight_tile, reuse_m)
+        block_shape = _resolve_launch_options(0, block_shape, num_stages, transpose_weight_tile, reuse_m, reuse_n)
         if any(torch_npu.get_npu_format(tensor) not in (0, 2) for tensor in (weight, weight_scale)):
             raise ValueError("TQBMM requires ND storage; NZ is not supported")
         bound_weight = weight.detach()
@@ -411,6 +470,7 @@ class PreparedDynamicWoA:
         object.__setattr__(self, "_num_stages", num_stages)
         object.__setattr__(self, "_transpose_weight_tile", transpose_weight_tile)
         object.__setattr__(self, "_reuse_m", reuse_m)
+        object.__setattr__(self, "_reuse_n", reuse_n)
 
     def __call__(self, activations):
         groups, inner, columns = self._dimensions
@@ -443,7 +503,7 @@ class PreparedDynamicWoA:
         if any(torch_npu.get_npu_format(tensor) not in (0, 2) for tensor in (quantized, scales)):
             raise ValueError("TQBMM requires ND storage; NZ is not supported")
         block_m, block_n, block_k = self._block_shape
-        grid = (triton.cdiv(tokens, block_m * self._reuse_m) * triton.cdiv(columns, block_n), groups)
+        grid = (triton.cdiv(tokens, block_m * self._reuse_m) * triton.cdiv(columns, block_n * self._reuse_n), groups)
         _transpose_quant_batch_matmul_kernel[grid](
             quantized,
             self._weight,
@@ -467,6 +527,7 @@ class PreparedDynamicWoA:
             GROUP_SIZE_M=DEFAULT_GROUP_SIZE_M,
             TRANSPOSE_WEIGHT_TILE=self._transpose_weight_tile,
             REUSE_M=self._reuse_m,
+            REUSE_N=self._reuse_n,
             num_stages=self._num_stages,
         )
         return output
@@ -482,6 +543,7 @@ def dynamic_quant_grouped_wo_a(
     transpose_weight_tile=False,
     out=None,
     reuse_m=1,
+    reuse_n=1,
 ):
     """Keep CANN dynamic quantization, then run one fused TQBMM for all groups."""
     if activations.ndim != 3 or activations.dtype not in (torch.bfloat16, torch.float16):
@@ -509,4 +571,5 @@ def dynamic_quant_grouped_wo_a(
         transpose_weight_tile=transpose_weight_tile,
         out=out,
         reuse_m=reuse_m,
+        reuse_n=reuse_n,
     )

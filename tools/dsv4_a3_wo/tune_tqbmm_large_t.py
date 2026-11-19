@@ -23,6 +23,8 @@ from tools.dsv4_a3_wo.tune_tqbmm import (
     ACTIVATION_SCRATCH_BYTES_PER_ELEMENT,
     AUTOMATIC_PIPELINE_SCREEN_FACTOR,
     EPILOGUE_SCRATCH_BYTES_PER_ELEMENT,
+    VECTOR_PADDING_BYTES,
+    WEIGHT_SCRATCH_BYTES_PER_ELEMENT,
     WorkerFailure,
     run_worker,
     validate_exact_report,
@@ -36,22 +38,35 @@ from tools.dsv4_a3_wo.tune_tqbmm import (
 @dataclass(frozen=True)
 class Candidate(TileCandidate):
     reuse_m: int = 1
+    reuse_n: int = 1
 
     @property
     def tag(self):
-        return super().tag + (f"-rm{self.reuse_m}" if self.reuse_m != 1 else "")
+        return (
+            super().tag
+            + (f"-rm{self.reuse_m}" if self.reuse_m != 1 else "")
+            + (f"-rn{self.reuse_n}" if self.reuse_n != 1 else "")
+        )
 
     def options(self):
-        return super().options() + (["--reuse-m", str(self.reuse_m)] if self.reuse_m != 1 else [])
+        return (
+            super().options()
+            + (["--reuse-m", str(self.reuse_m)] if self.reuse_m != 1 else [])
+            + (["--reuse-n", str(self.reuse_n)] if self.reuse_n != 1 else [])
+        )
 
     @property
     def estimated_ub_bytes(self):
-        # Two live A tiles / accumulators, one shared B tile. This remains a
+        # Account for live A/B tiles and all independent accumulators. This is a
         # conservative heuristic, NOT a queried capacity or compiler allocation.
         factor = AUTOMATIC_PIPELINE_SCREEN_FACTOR if self.num_stages == 2 else 1
-        extra = (self.reuse_m - 1) * (
-            ACTIVATION_SCRATCH_BYTES_PER_ELEMENT * self.block_m * self.block_k
-            + EPILOGUE_SCRATCH_BYTES_PER_ELEMENT * self.block_m * self.block_n
+        extra = (
+            (self.reuse_m - 1) * ACTIVATION_SCRATCH_BYTES_PER_ELEMENT * self.block_m * self.block_k
+            + (self.reuse_n - 1)
+            * (2 * VECTOR_PADDING_BYTES + WEIGHT_SCRATCH_BYTES_PER_ELEMENT)
+            * self.block_n
+            * self.block_k
+            + (self.reuse_m * self.reuse_n - 1) * EPILOGUE_SCRATCH_BYTES_PER_ELEMENT * self.block_m * self.block_n
         )
         return super().estimated_ub_bytes + extra * factor
 
@@ -85,9 +100,10 @@ def build_candidates(args):
     if args.tile_loads == "both":
         choices += [Candidate(c.block_m, c.block_n, c.block_k, c.num_stages, True) for c in tuple(choices)]
     choices = [
-        Candidate(c.block_m, c.block_n, c.block_k, c.num_stages, c.transpose_weight_tile, reuse_m)
+        Candidate(c.block_m, c.block_n, c.block_k, c.num_stages, c.transpose_weight_tile, reuse_m, reuse_n)
         for c in choices
         for reuse_m in args.reuse_m
+        for reuse_n in args.reuse_n
     ]
     control = Candidate(*args.control)
     for c in [control, *choices]:
@@ -119,6 +135,7 @@ def parse_args(argv=None):
     parser.add_argument("--candidate", nargs=4, type=int, action="append", metavar=("M", "N", "K", "STAGES"))
     parser.add_argument("--tile-loads", choices=("direct", "both"), default="direct")
     parser.add_argument("--reuse-m", type=int, nargs="+", choices=(1, 2), default=[1])
+    parser.add_argument("--reuse-n", type=int, nargs="+", choices=(1, 2), default=[1])
     parser.add_argument("--control", type=int, nargs=4, default=[64, 64, 128, 2], metavar=("M", "N", "K", "STAGES"))
     parser.add_argument("--top-k", type=int, default=3, help="Non-control finalists selected by screening")
     parser.add_argument("--selection-mode", choices=("eager", "graph"), default="eager")
@@ -218,6 +235,8 @@ def validate_measurement(report, args, candidate, tokens, expected_format=None):
         raise ValueError("Worker tile-load mode differs")
     if report.get("reuse_m", 1) != candidate.reuse_m:
         raise ValueError("Worker M-tile reuse differs")
+    if report.get("reuse_n", 1) != candidate.reuse_n:
+        raise ValueError("Worker N-tile reuse differs")
     if report.get("prepared_dynamic") is not True:
         raise ValueError("Worker did not use the server's PreparedDynamicWoA path")
     if "allow_internal_format" not in report:
@@ -371,6 +390,8 @@ def trial(args, output, report, result, candidate, phase, tokens=None, seed=0, g
     suffix = gate or f"T{tokens}-seed{seed}"
     log = output / "logs" / f"{candidate.tag}-{phase}-{suffix}.log"
     command = benchmark_command(args, candidate, tokens, seed)
+    if tokens is not None:
+        command += ["--failure-dir", str(output / "failures" / candidate.tag)]
     if gate:
         command.append("--" + gate.replace("_", "-"))
     record = {
@@ -392,6 +413,8 @@ def trial(args, output, report, result, candidate, phase, tokens=None, seed=0, g
                 raise ValueError(f"Correctness gate failed: {gate}")
             if r.get("reuse_m", 1) != candidate.reuse_m:
                 raise ValueError("Correctness gate used a different reuse_m")
+            if r.get("reuse_n", 1) != candidate.reuse_n:
+                raise ValueError("Correctness gate used a different reuse_n")
         else:
             validate_measurement(r, args, candidate, tokens, report.get("effective_internal_format"))
             report["effective_internal_format"] = r["allow_internal_format"]
@@ -468,6 +491,7 @@ def main(argv=None):
         "vllm_ascend/ops/triton/transpose_quant_batch_matmul.py",
         "vllm_ascend/attention/dsa_v1.py",
         "autotune_tqbmm_reuse.py",
+        "autotune_tqbmm_data_reuse.py",
     )
     report = {
         "schema_version": 1,

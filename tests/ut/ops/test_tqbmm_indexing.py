@@ -103,7 +103,10 @@ def load_function(name, namespace):
 )
 @pytest.mark.parametrize("transpose_weight_tile", [False, True])
 @pytest.mark.parametrize("reuse_m", [1, 2])
-def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided, block_shape, transpose_weight_tile, reuse_m):
+@pytest.mark.parametrize("reuse_n", [1, 2])
+def test_actual_kernel_addressing_and_int8_arithmetic(
+    shape, strided, block_shape, transpose_weight_tile, reuse_m, reuse_n
+):
     tokens, groups, inner, columns = shape
     rng = np.random.default_rng(0)
     if strided:
@@ -124,7 +127,7 @@ def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided, block_shap
     actual = np.full((tokens, groups, columns), np.nan, dtype=np.float32)
     strides = tuple(step // value.itemsize for value in (x, weight, sx, sw) for step in value.strides)
     block_m, block_n, block_k = block_shape
-    num_tiles = Language.cdiv(tokens, block_m * reuse_m) * Language.cdiv(columns, block_n)
+    num_tiles = Language.cdiv(tokens, block_m * reuse_m) * Language.cdiv(columns, block_n * reuse_n)
     for group in range(groups):
         for pid in range(num_tiles):
             kernel = load_function("_transpose_quant_batch_matmul_kernel", {"tl": Language(pid, group)})
@@ -145,6 +148,7 @@ def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided, block_shap
                 4,
                 transpose_weight_tile,
                 reuse_m,
+                reuse_n,
             )
     integer_golden = np.einsum("tgk,gkn->tgn", x.astype(np.int64), weight.astype(np.int64))
     expected = (integer_golden.astype(np.float32) * sw[None]) * sx[:, :, None]
@@ -154,7 +158,8 @@ def test_actual_kernel_addressing_and_int8_arithmetic(shape, strided, block_shap
 @pytest.mark.parametrize("start,end", [(0, 32), (32, 64), (2048, 2080), (4064, 4096), (0, 64), (0, 65), (0, 4096)])
 @pytest.mark.parametrize("transpose_weight_tile", [False, True])
 @pytest.mark.parametrize("reuse_m", [1, 2])
-def test_fixed_physical_weight_pitch_with_logical_k_slices(start, end, transpose_weight_tile, reuse_m):
+@pytest.mark.parametrize("reuse_n", [1, 2])
+def test_fixed_physical_weight_pitch_with_logical_k_slices(start, end, transpose_weight_tile, reuse_m, reuse_n):
     """Physical column stride stays 4096 even when logical K is 32 or 65."""
     tokens, groups, physical_k, columns = 17, 2, 4096, 33
     rng = np.random.default_rng(1)
@@ -167,7 +172,7 @@ def test_fixed_physical_weight_pitch_with_logical_k_slices(start, end, transpose
     actual = np.full((tokens, groups, columns), np.nan, dtype=np.float32)
     strides = tuple(step // value.itemsize for value in (x, weight, sx, sw) for step in value.strides)
     block_m, block_n, block_k = 16, 32, 32
-    num_tiles = Language.cdiv(tokens, block_m * reuse_m) * Language.cdiv(columns, block_n)
+    num_tiles = Language.cdiv(tokens, block_m * reuse_m) * Language.cdiv(columns, block_n * reuse_n)
     for group in range(groups):
         for pid in range(num_tiles):
             kernel = load_function("_transpose_quant_batch_matmul_kernel", {"tl": Language(pid, group)})
@@ -188,6 +193,7 @@ def test_fixed_physical_weight_pitch_with_logical_k_slices(start, end, transpose
                 4,
                 transpose_weight_tile,
                 reuse_m,
+                reuse_n,
             )
     golden = np.einsum("tgk,gkn->tgn", x.astype(np.int64), weight.astype(np.int64))
     expected = (golden.astype(np.float32) * sw[None]) * sx[:, :, None]
@@ -242,6 +248,70 @@ def test_paired_m_shares_b_loads_without_reducing_dot_count():
     np.testing.assert_array_equal(outputs[1][0], outputs[2][0])
     assert outputs[2][1]["b_loads"] * 2 == outputs[1][1]["b_loads"]
     assert outputs[2][1]["dots"] == outputs[1][1]["dots"] == 6
+
+
+@pytest.mark.parametrize("block_shape", [(128, 128, 64), (64, 128, 64)])
+@pytest.mark.parametrize("reuse_m", [1, 2])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_wider_n_and_reuse_cover_full_regions_and_masked_tails(block_shape, reuse_m, transposed):
+    test_actual_kernel_addressing_and_int8_arithmetic((257, 2, 129, 257), True, block_shape, transposed, reuse_m, 2)
+
+
+def test_two_axis_reuse_reduces_a_and_b_loads_but_preserves_dots():
+    """Count source SSA loads, not actual HBM traffic or compiler buffers."""
+    rng = np.random.default_rng(3)
+    x = rng.integers(-128, 128, (64, 1, 65), dtype=np.int8)
+    w_storage = rng.integers(-128, 128, (1, 64, 65), dtype=np.int8)
+    weight = w_storage.transpose(0, 2, 1)
+    sx, sw = np.ones((64, 1), dtype=np.float32), np.ones((1, 64), dtype=np.float32)
+    strides = tuple(s // a.itemsize for a in (x, weight, sx, sw) for s in a.strides)
+    counter = {}
+
+    class CountLanguage(Language):
+        def load(self, pointer, mask, other):
+            if np.shares_memory(pointer.storage, x):
+                counter["a"] += 1
+            if np.shares_memory(pointer.storage, w_storage):
+                counter["b"] += 1
+            return super().load(pointer, mask, other)
+
+        def dot(self, a, b, accumulator, out_dtype):
+            counter["dots"] += 1
+            return super().dot(a, b, accumulator, out_dtype)
+
+    all_counts = {}
+    for reuse_m in (1, 2):
+        for reuse_n in (1, 2):
+            counter.update(a=0, b=0, dots=0)
+            output = np.full((64, 1, 64), np.nan, dtype=np.float32)
+            for pid in range(Language.cdiv(64, 32 * reuse_m) * Language.cdiv(64, 32 * reuse_n)):
+                kernel = load_function("_transpose_quant_batch_matmul_kernel", {"tl": CountLanguage(pid, 0)})
+                kernel(
+                    Pointer(x),
+                    Pointer(w_storage),
+                    Pointer(sx),
+                    Pointer(sw),
+                    Pointer(output),
+                    64,
+                    1,
+                    65,
+                    64,
+                    *strides,
+                    32,
+                    32,
+                    32,
+                    4,
+                    False,
+                    reuse_m,
+                    reuse_n,
+                )
+            golden = np.einsum("tgk,gkn->tgn", x.astype(np.int64), weight.astype(np.int64)).astype(np.float32)
+            np.testing.assert_array_equal(output, golden)
+            all_counts[reuse_m, reuse_n] = dict(counter)
+    assert all_counts[1, 1] == {"a": 12, "b": 12, "dots": 12}
+    assert all_counts[1, 2] == {"a": 6, "b": 12, "dots": 12}
+    assert all_counts[2, 1] == {"a": 12, "b": 6, "dots": 12}
+    assert all_counts[2, 2] == {"a": 6, "b": 6, "dots": 12}
 
 
 @pytest.mark.parametrize("num_stages", [1, 2, 0, -1, 3, "1", None, True, 1.0])

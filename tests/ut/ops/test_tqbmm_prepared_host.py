@@ -162,10 +162,12 @@ def inputs(backend, tokens=17):
 
 
 @pytest.mark.parametrize("kind", ["safe", "fixed", "dynamic", "dynamic_safe"])
-def test_paired_m_launch_wiring_for_all_entry_points(host, kind):
+@pytest.mark.parametrize("reuse_m", [1, 2])
+@pytest.mark.parametrize("reuse_n", [1, 2])
+def test_paired_m_launch_wiring_for_all_entry_points(host, kind, reuse_m, reuse_n):
     module, backend = host
     x, weight, sx, sw = inputs(backend, tokens=129)
-    options = {"block_shape": (64, 32, 32), "reuse_m": 2}
+    options = {"block_shape": (64, 32, 32), "reuse_m": reuse_m, "reuse_n": reuse_n}
     if kind == "safe":
         result = module.transpose_quant_batch_matmul(x, weight, sx, sw, **options)
     elif kind == "fixed":
@@ -176,12 +178,17 @@ def test_paired_m_launch_wiring_for_all_entry_points(host, kind):
         if kind == "dynamic":
             plan = module.PreparedDynamicWoA(weight, sw, **options)
             result = plan(activations)
-            assert plan._reuse_m == 2
+            assert plan._reuse_m == reuse_m
+            assert plan._reuse_n == reuse_n
         else:
             result = module.dynamic_quant_grouped_wo_a(activations, weight, sw, **options)
     assert result.shape == (129, 2, 33)
-    assert backend.launches[-1][0] == (4, 2)
-    assert backend.launches[-1][2]["REUSE_M"] == 2
+    assert backend.launches[-1][0] == (
+        ((129 + 64 * reuse_m - 1) // (64 * reuse_m)) * ((33 + 32 * reuse_n - 1) // (32 * reuse_n)),
+        2,
+    )
+    assert backend.launches[-1][2]["REUSE_M"] == reuse_m
+    assert backend.launches[-1][2]["REUSE_N"] == reuse_n
 
 
 @pytest.mark.parametrize("reuse_m", [0, 3, True, 2.0, "2", None])
@@ -196,6 +203,21 @@ def test_invalid_reuse_rejected_without_launch(host, reuse_m, kind):
             module.PreparedTQBMM(x, weight, sx, sw, reuse_m=reuse_m)
         else:
             module.PreparedDynamicWoA(weight, sw, reuse_m=reuse_m)
+    assert not backend.launches
+
+
+@pytest.mark.parametrize("reuse_n", [0, 3, True, 2.0, "2", None])
+@pytest.mark.parametrize("kind", ["safe", "fixed", "dynamic"])
+def test_invalid_n_reuse_rejected_without_launch(host, reuse_n, kind):
+    module, backend = host
+    x, weight, sx, sw = inputs(backend)
+    with pytest.raises(ValueError, match="reuse_n"):
+        if kind == "safe":
+            module.transpose_quant_batch_matmul(x, weight, sx, sw, reuse_n=reuse_n)
+        elif kind == "fixed":
+            module.PreparedTQBMM(x, weight, sx, sw, reuse_n=reuse_n)
+        else:
+            module.PreparedDynamicWoA(weight, sw, reuse_n=reuse_n)
     assert not backend.launches
 
 
@@ -279,6 +301,7 @@ def test_prepared_caches_geometry_but_keeps_shared_values_alive(host):
         "GROUP_SIZE_M": 4,
         "TRANSPOSE_WEIGHT_TILE": False,
         "REUSE_M": 1,
+        "REUSE_N": 1,
         "num_stages": 2,
     }
     with pytest.raises(FrozenInstanceError):

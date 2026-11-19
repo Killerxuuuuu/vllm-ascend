@@ -288,3 +288,10 @@ AIC Scalar、Fixpipe 和部分 AIV 时间，以及各指标覆盖的调用次数
 流水时间可重叠，不能相加或从总时间相减来计算空闲与等待。
 `export.tar.gz` 只包含分析文件、参数和日志，不含原始 PROF 数据或模型权重。
 profiler 存在测量开销，最终加速结论仍以关闭 profiler 的 benchmark 为准。
+
+## 6. 加宽 N 与两轴复用
+
+增加实验参数 `reuse_n=2`（CLI 为 `--reuse-n 2`），使同一块 X 服务两块 N 输出；
+可与 `reuse_m=2` 组合。公共接口及整网默认值不变。
+新入口 `autotune_tqbmm_data_reuse.py` 自动对照旧/宽 N 分块及两轴复用的 32 个候选。
+完整方法、资源边界和服务器指令见 [双向复用实验](../../TQBMM_TWO_AXIS_REUSE.md)。

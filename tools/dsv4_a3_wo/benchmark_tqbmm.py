@@ -29,6 +29,15 @@ LAYOUT_CHECK_INNER_SIZES = (32, 4096)
 DEFAULT_GRAPH_BATCH_SIZE = 16
 
 
+def layout_check_shape(args):
+    if getattr(args, "reuse_n", 1) == 1:
+        return LAYOUT_CHECK_TOKENS, LAYOUT_CHECK_COLUMNS
+    block_m, block_n, _ = args.block_shape or (16, 32, 32)
+    # Exercise full reused regions AND another masked region. Tiny legacy
+    # gates would otherwise leave the second N tile entirely masked out.
+    return block_m * getattr(args, "reuse_m", 1) + 1, block_n * args.reuse_n + 1
+
+
 @torch.inference_mode()
 def check_weight_layouts(args):
     """Isolate signed loads, strided weights and single/multi-K accumulation."""
@@ -36,15 +45,16 @@ def check_weight_layouts(args):
         raise RuntimeError("This probe requires an Ascend A3 NPU and Triton-Ascend")
     torch.npu.set_device(args.device)
     torch.manual_seed(args.seed)
-    sx = torch.ones(LAYOUT_CHECK_TOKENS, 1, device=args.device, dtype=torch.float32)
-    sw = torch.ones(1, LAYOUT_CHECK_COLUMNS, device=args.device, dtype=torch.float32)
+    tokens, columns = layout_check_shape(args)
+    sx = torch.ones(tokens, 1, device=args.device, dtype=torch.float32)
+    sw = torch.ones(1, columns, device=args.device, dtype=torch.float32)
     results = []
     block_shape = tuple(args.block_shape) if args.block_shape else (16, 32, 32)
     for inner in LAYOUT_CHECK_INNER_SIZES:
         for signed in (False, True):
             low = -8 if signed else 0
-            x_cpu = torch.randint(low, 9, (LAYOUT_CHECK_TOKENS, 1, inner), dtype=torch.int8)
-            w_cpu = torch.randint(low, 9, (1, LAYOUT_CHECK_COLUMNS, inner), dtype=torch.int8)
+            x_cpu = torch.randint(low, 9, (tokens, 1, inner), dtype=torch.int8)
+            w_cpu = torch.randint(low, 9, (1, columns, inner), dtype=torch.int8)
             expected = torch.bmm(x_cpu.double().transpose(0, 1), w_cpu.double().transpose(1, 2))
             expected = expected.transpose(0, 1).float()
             x = x_cpu.to(args.device)
@@ -61,6 +71,7 @@ def check_weight_layouts(args):
                     num_stages=args.num_stages,
                     transpose_weight_tile=args.transpose_weight_tile,
                     reuse_m=getattr(args, "reuse_m", 1),
+                    reuse_n=getattr(args, "reuse_n", 1),
                 ).cpu()
                 diff = (actual - expected).abs()
                 # Diagnostic only: both tensors are now on CPU, outside timing.
@@ -84,6 +95,7 @@ def check_weight_layouts(args):
         "cases": len(results),
         "num_stages": args.num_stages,
         "reuse_m": getattr(args, "reuse_m", 1),
+        "reuse_n": getattr(args, "reuse_n", 1),
     }
 
 
@@ -101,12 +113,13 @@ def check_k_loop(args):
     torch.manual_seed(args.seed)
     inner = LAYOUT_CHECK_INNER_SIZES[-1]
     block_k = LAYOUT_CHECK_INNER_SIZES[0]
-    x_cpu = torch.randint(-8, 9, (LAYOUT_CHECK_TOKENS, 1, inner), dtype=torch.int8)
-    w_cpu = torch.randint(-8, 9, (1, LAYOUT_CHECK_COLUMNS, inner), dtype=torch.int8)
+    tokens, columns = layout_check_shape(args)
+    x_cpu = torch.randint(-8, 9, (tokens, 1, inner), dtype=torch.int8)
+    w_cpu = torch.randint(-8, 9, (1, columns, inner), dtype=torch.int8)
     x = x_cpu.to(args.device)
     weight = w_cpu.to(args.device).transpose(1, 2)
-    sx = torch.ones(LAYOUT_CHECK_TOKENS, 1, device=args.device, dtype=torch.float32)
-    sw = torch.ones(1, LAYOUT_CHECK_COLUMNS, device=args.device, dtype=torch.float32)
+    sx = torch.ones(tokens, 1, device=args.device, dtype=torch.float32)
+    sw = torch.ones(1, columns, device=args.device, dtype=torch.float32)
     # Nonzero offsets and a masked tail; every view retains the same K pitch.
     spans = (
         (0, block_k),
@@ -140,6 +153,7 @@ def check_k_loop(args):
             num_stages=args.num_stages,
             transpose_weight_tile=args.transpose_weight_tile,
             reuse_m=getattr(args, "reuse_m", 1),
+            reuse_n=getattr(args, "reuse_n", 1),
         ).cpu()
         diff = (actual - expected).abs()
         case = {
@@ -162,6 +176,7 @@ def check_k_loop(args):
         "cases": len(results),
         "num_stages": args.num_stages,
         "reuse_m": getattr(args, "reuse_m", 1),
+        "reuse_n": getattr(args, "reuse_n", 1),
     }
 
 
@@ -327,6 +342,7 @@ def run(args):
     sx = sx.reshape(args.tokens, groups).float()
     block_shape = tuple(args.block_shape) if args.block_shape else None
     reuse_m = getattr(args, "reuse_m", 1)
+    reuse_n = getattr(args, "reuse_n", 1)
 
     def fused():
         return transpose_quant_batch_matmul(
@@ -338,6 +354,7 @@ def run(args):
             num_stages=args.num_stages,
             transpose_weight_tile=args.transpose_weight_tile,
             reuse_m=reuse_m,
+            reuse_n=reuse_n,
         )
 
     def reference():
@@ -352,6 +369,7 @@ def run(args):
             num_stages=args.num_stages,
             transpose_weight_tile=args.transpose_weight_tile,
             reuse_m=reuse_m,
+            reuse_n=reuse_n,
         )
         if prepared_dynamic
         else None
@@ -368,6 +386,7 @@ def run(args):
             num_stages=args.num_stages,
             transpose_weight_tile=args.transpose_weight_tile,
             reuse_m=reuse_m,
+            reuse_n=reuse_n,
         )
 
     actual, expected = fused(), reference()
@@ -413,6 +432,7 @@ def run(args):
         },
         "prepared_dynamic": prepared_dynamic,
         "reuse_m": reuse_m,
+        "reuse_n": reuse_n,
         "instrumentation": instrumentation,
         "num_stages": args.num_stages,
         "requested_block_shape": block_shape,
@@ -468,6 +488,9 @@ def parse_args():
     parser.add_argument("--prepared-dynamic", action="store_true", help="Use the server's PreparedDynamicWoA path")
     parser.add_argument(
         "--reuse-m", type=int, choices=(1, 2), default=1, help="Experimental B-tile reuse across M tiles"
+    )
+    parser.add_argument(
+        "--reuse-n", type=int, choices=(1, 2), default=1, help="Experimental A-tile reuse across N tiles"
     )
     parser.add_argument("--reject-instrumentation", action="store_true", help="Reject detected msMemScope injection")
     parser.add_argument("--quant-model", type=Path)
