@@ -294,3 +294,73 @@ def test_ir_counts_do_not_count_types_or_attributes_as_operations(inspector, tmp
     )
     result = inspector.summarize_ir(path)
     assert result["static_op_counts"] == {"hivm.hir.sync_block_wait": 1}
+
+
+def test_pretty_bracket_sync_and_macro_sync_suffix_are_preserved(inspector, tmp_path):
+    path = tmp_path / "actual-style.mlir"
+    path.write_text(
+        "func.func @kernel_mix_aic() {\n"
+        "  %c0 = arith.constant 0 : i64\n"
+        "  %c1 = arith.constant 1 : i64\n"
+        "  %cn = arith.constant -1 : i64\n"
+        "  %c4 = arith.constant 4 : i64\n"
+        "  scf.for %iv = %c0 to %c4 step %c1 {\n"
+        "    %event = arith.addi %iv, %c0 : i64\n"
+        "    hivm.hir.set_flag[<PIPE_MTE2>, <PIPE_MTE1>, %event]\n"
+        "    hivm.hir.mmadL1 "
+        + ("long_operand_type " * 70)
+        + " sync_related_args(%c0, %c1, %cn, %cn, %event, %cn, %cn : i64, i64, i64, i64, i64, i64, i64)\n"
+        "    hivm.hir.sync_block_wait[<CUBE>, <PIPE_MTE3>, <PIPE_MTE1>] flag = %event\n"
+        "  }\n}\n"
+        "func.func @kernel_mix_aiv() {\n"
+        "  %c0 = arith.constant 17 : i64\n"
+        "  hivm.hir.wait_flag[<PIPE_MTE3>, <PIPE_V>, %c0]\n}\n"
+    )
+    summary = inspector.summarize_ir(path)
+    assert summary["static_op_counts"]["hivm.hir.set_flag"] == 1
+    assert summary["static_op_counts"]["hivm.hir.sync_block_wait"] == 1
+    assert summary["static_op_counts"]["hivm.hir.wait_flag"] == 1
+    assert any("sync_related_args(%c0, %c1, %cn, %cn, %event, %cn, %cn)" in line for line in summary["samples"]["sync"])
+    context = inspector.sync_context(path)
+    assert context["functions"] == {1: "kernel_mix_aic", 2: "kernel_mix_aiv"}
+    assert len(context["events"]) == 4 and not context["unresolved"]
+    assert any("[F1]" in line and "%c0 = arith.constant 0" in line for line in context["definitions"])
+    assert any("[F2]" in line and "%c0 = arith.constant 17" in line for line in context["definitions"])
+    assert any("scf.for %iv" in line for line in context["definitions"])
+
+
+def test_focused_sync_paste_does_not_recompile(inspector, tmp_path, monkeypatch, capsys):
+    (tmp_path / "manifest.json").write_text("{}")
+    write_capture(tmp_path / "prefetch_s2", "prefetch_s2")
+
+    def forbidden():
+        raise AssertionError("Reading sync context must not initialize an NPU")
+
+    monkeypatch.setattr(inspector, "check_python_environment", forbidden)
+    inspector.main(["--output", str(tmp_path), "--paste", "--paste-case", "prefetch_s2", "--paste-sync"])
+    text = capsys.readouterr().out
+    assert "macro sync operands" in text and "referenced SSA definitions" in text
+    assert "sync_block_set" in text
+    with pytest.raises(SystemExit):
+        inspector.parse_args(["--output", str(tmp_path), "--paste-sync"])
+
+
+def test_sync_context_keeps_if_else_guards_not_just_event_ids(inspector, tmp_path):
+    path = tmp_path / "guard.mlir"
+    path.write_text(
+        "func.func @aic() {\n"
+        "  %id = arith.constant 1 : i64\n"
+        "  %condition = arith.constant true\n"
+        "  scf.if %condition {\n"
+        "    hivm.hir.set_flag[<PIPE_MTE1>, <PIPE_MTE2>, %id]\n"
+        "  } else {\n"
+        "    hivm.hir.wait_flag[<PIPE_MTE1>, <PIPE_MTE2>, %id]\n"
+        "  }\n"
+        "  hivm.hir.wait_flag[<PIPE_MTE1>, <PIPE_MTE2>, %id]\n}\n"
+    )
+    context = inspector.sync_context(path)
+    assert len(context["control_contexts"]) == 3
+    assert "scf.if %condition" in context["control_contexts"][0]
+    assert "else of L4" in context["control_contexts"][1]
+    assert "function level" in context["control_contexts"][2]
+    assert any("%condition = arith.constant true" in line for line in context["definitions"])

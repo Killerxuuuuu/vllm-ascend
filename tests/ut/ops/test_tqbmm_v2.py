@@ -46,7 +46,20 @@ class V2Language(Language):
 
     @staticmethod
     def gather(array, indices, axis):
-        return np.take_along_axis(array, indices, axis).view(Array)
+        raise AssertionError("V2 static panel slicing must not use gather")
+
+    @staticmethod
+    def reshape(array, shape):
+        return np.reshape(array, shape).view(Array)
+
+    @staticmethod
+    def permute(array, dimensions):
+        return np.transpose(array, dimensions).view(Array)
+
+    @staticmethod
+    def split(array):
+        assert array.shape[-1] == 2
+        return array[..., 0].view(Array), array[..., 1].view(Array)
 
 
 def test_static_range_rejects_tensor_cdiv_result():
@@ -84,19 +97,71 @@ def test_shape_control_and_micro_loop_bound_are_explicit_constexpr():
     assert ast.unparse(micro_loop.iter) == "tl.static_range(micro_tiles)"
 
 
-def load_kernels(language):
+def load_kernel_namespace(language):
     nodes = []
     for node in ast.parse(SOURCE.read_text(encoding="utf-8")).body:
-        if isinstance(node, ast.FunctionDef) and node.name.startswith(
-            ("_v2_coordinates", "_v2_load_panel", "_v2_dot_panel", "_transpose_")
-        ):
+        if isinstance(node, ast.FunctionDef) and node.name.startswith(("_v2_", "_transpose_")):
             node.decorator_list = []
             for argument in node.args.args:
                 argument.annotation = None
             nodes.append(node)
     namespace = {"tl": language, "GROUP_SIZE_M": 4}
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(SOURCE), "exec"), namespace)
-    return namespace["_transpose_quant_batch_matmul_v2_kernel"]
+    return namespace
+
+
+def load_kernels(language):
+    return load_kernel_namespace(language)["_transpose_quant_batch_matmul_v2_kernel"]
+
+
+@pytest.mark.parametrize("block_shape", [(16, 32, 32), (32, 32, 64), (64, 16, 128), (128, 64, 128)])
+@pytest.mark.parametrize("panel_ratio", [1, 2, 4])
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.parametrize("signed", [False, True])
+def test_static_panel_subtiles_preserve_exact_int8_k_order(block_shape, panel_ratio, transposed, signed):
+    """Execute the real split/reshape/permute helpers, including quarter order.
+
+    No compiler or device claim: these tests establish exact byte selection
+    for all supported panel ratios, full-range INT8, and both W layouts.
+    """
+    bm, bn, dot_k = block_shape
+    panel_k = dot_k * panel_ratio
+    rng = np.random.default_rng(7)
+    low = -128 if signed else 0
+    a = rng.integers(low, 128, (bm, panel_k), dtype=np.int8).view(Array)
+    if transposed:
+        b = rng.integers(low, 128, (bn, panel_k), dtype=np.int8).T.view(Array)
+    else:
+        b = rng.integers(low, 128, (panel_k, bn), dtype=np.int8).view(Array)
+    subtile = load_kernel_namespace(V2Language(0, 0))["_v2_panel_subtile"]
+    a_parts, b_parts = [], []
+    for micro in range(panel_ratio):
+        actual_a, actual_b = subtile(a, b, bm, bn, dot_k, panel_k, micro)
+        k_start = micro * dot_k
+        np.testing.assert_array_equal(actual_a, a[:, k_start : k_start + dot_k])
+        np.testing.assert_array_equal(actual_b, b[k_start : k_start + dot_k, :])
+        assert actual_a.dtype == actual_b.dtype == np.int8
+        a_parts.append(actual_a)
+        b_parts.append(actual_b)
+    np.testing.assert_array_equal(np.concatenate(a_parts, axis=1), a)
+    np.testing.assert_array_equal(np.concatenate(b_parts, axis=0), b)
+
+
+def test_panel_slicing_has_no_indexed_gathers_or_dtype_conversions():
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    for name in ("_v2_split_panel_halves", "_v2_panel_subtile", "_v2_dot_panel"):
+        calls = [node for node in ast.walk(functions[name]) if isinstance(node, ast.Call)]
+        assert not any(
+            isinstance(node.func, ast.Attribute) and node.func.attr in ("gather", "to", "cast", "bitcast")
+            for node in calls
+        )
+    helper_calls = {
+        node.func.attr
+        for node in ast.walk(functions["_v2_split_panel_halves"])
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert helper_calls == {"reshape", "permute", "split"}
 
 
 @pytest.mark.parametrize(

@@ -69,6 +69,51 @@ def _v2_load_panel(
 
 
 @triton.jit
+def _v2_split_panel_halves(a_panel, b_panel, BM: tl.constexpr, BN: tl.constexpr, HALF_K: tl.constexpr):
+    # Move the two *contiguous K halves* to the final, size-two axis. split
+    # lowers to static extract_slice operations, not indexed gather/scalar
+    # tensor extraction. These are SSA shape/layout ops; physical movement
+    # remains a compiler decision and must be checked in the generated IR.
+    a_halves = tl.permute(tl.reshape(a_panel, (BM, 2, HALF_K)), (0, 2, 1))
+    b_halves = tl.permute(tl.reshape(b_panel, (2, HALF_K, BN)), (1, 2, 0))
+    a_low, a_high = tl.split(a_halves)
+    b_low, b_high = tl.split(b_halves)
+    return a_low, b_low, a_high, b_high
+
+
+@triton.jit
+def _v2_panel_subtile(
+    a_panel,
+    b_panel,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    DOT_K: tl.constexpr,
+    PANEL_K: tl.constexpr,
+    MICRO: tl.constexpr,
+):
+    # Only 1/2/4 dot tiles per panel are accepted by validate_v2_options.
+    # Preserve increasing K order without any runtime indices. In particular,
+    # B's former axis-0 gather became 64x32 scalar loops on A3, with an
+    # inserted full-index-table GM store *inside* each scalar iteration.
+    if PANEL_K == DOT_K:
+        return a_panel, b_panel
+    else:
+        a_low, b_low, a_high, b_high = _v2_split_panel_halves(a_panel, b_panel, BM, BN, PANEL_K // 2)
+        if MICRO < PANEL_K // DOT_K // 2:
+            a_half, b_half = a_low, b_low
+        else:
+            a_half, b_half = a_high, b_high
+        if PANEL_K == 2 * DOT_K:
+            return a_half, b_half
+        else:
+            a_first, b_first, a_second, b_second = _v2_split_panel_halves(a_half, b_half, BM, BN, DOT_K)
+            if MICRO % 2 == 0:
+                return a_first, b_first
+            else:
+                return a_second, b_second
+
+
+@triton.jit
 def _v2_dot_panel(
     a_panel,
     b_panel,
@@ -86,12 +131,7 @@ def _v2_dot_panel(
     # arithmetic in constexpr space so static_range never receives int32[].
     micro_tiles: tl.constexpr = (ACTIVE_K + DOT_K - 1) // DOT_K
     for micro in tl.static_range(micro_tiles):
-        if PANEL_K == DOT_K:
-            a, b = a_panel, b_panel
-        else:
-            indices = micro * DOT_K + tl.arange(0, DOT_K)
-            a = tl.gather(a_panel, tl.broadcast_to(indices[None, :], (BM, DOT_K)), 1)
-            b = tl.gather(b_panel, tl.broadcast_to(indices[:, None], (DOT_K, BN)), 0)
+        a, b = _v2_panel_subtile(a_panel, b_panel, BM, BN, DOT_K, PANEL_K, micro)
         acc = tl.dot(a, b, acc, out_dtype=tl.int32)
     return acc
 

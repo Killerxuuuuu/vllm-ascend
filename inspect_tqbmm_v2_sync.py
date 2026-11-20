@@ -74,6 +74,9 @@ def parse_args(argv=None):
     )
     parser.add_argument("--paste-case", choices=("all", *CASES), default="all")
     parser.add_argument("--paste-max-chars", type=int, default=DEFAULT_PASTE_CHARS)
+    parser.add_argument(
+        "--paste-sync", action="store_true", help="Include complete sync operands and their SSA definitions"
+    )
     args = parser.parse_args(argv)
     if min(args.tokens, args.groups, args.inner, args.columns, args.programs, args.timeout) < 1:
         parser.error("Dimensions/programs/timeout must be positive")
@@ -86,6 +89,8 @@ def parse_args(argv=None):
         parser.error("--worker requires --case")
     if args.paste and (args.worker or args.dry_run):
         parser.error("--paste cannot be combined with --worker or --dry-run")
+    if args.paste_sync and not args.paste:
+        parser.error("--paste-sync requires --paste; it never starts compilation")
     if args.paste_max_chars < 2000:
         parser.error("--paste-max-chars must be >=2000")
     return args
@@ -266,6 +271,101 @@ def limited_text(value, limit):
     return value if len(value) <= limit else value[: limit - len(marker)] + marker
 
 
+def ir_operation(line):
+    # Pretty-printed synchronization uses op[<PIPE_...>] rather than op(...).
+    match = re.match(
+        r'^\s*(?:%[^=]*=\s*)?"?(hivm(?:\.[A-Za-z0-9_]+)+|scf\.(?:for|if|while|yield)|func\.(?:func|return))'
+        r'(?:"\s*\(|\s|\(|\[)',
+        line,
+    )
+    return match.group(1) if match else None
+
+
+def sync_operands(line):
+    match = re.search(r"\bsync_related_args\s*\(([^)]*)\)", line)
+    return match.group(1).split(":", 1)[0].strip() if match else None
+
+
+def is_sync_operation(name):
+    return any(token in name.lower() for token in ("sync", "set_flag", "wait_flag", "barrier"))
+
+
+def sync_context(path):
+    """Read macro sync operands without assuming compiler-version slot order.
+
+    SSA names are local to each function. Resolve definitions/loop IVs only
+    within their function, and expose unresolved values instead of guessing.
+    This is source context, not a graph solver or proof of a missing event.
+    """
+    scope, functions, definitions, events = 0, {}, {}, []
+    active_controls, control_paths = [], {}
+    ssa_pattern = r"%[A-Za-z0-9_$.-]+(?:#\d+)?"
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for number, line in enumerate(handle, 1):
+            name = ir_operation(line)
+            indent = len(line) - len(line.lstrip())
+            popped = []
+            if line.strip():
+                while active_controls and indent <= active_controls[-1][0]:
+                    popped.append(active_controls.pop())
+            if name == "func.func":
+                scope += 1
+                active_controls.clear()
+                symbol = re.search(r'@([A-Za-z0-9_$.-]+)|sym_name\s*=\s*"([^"]+)"', line)
+                functions[scope] = next(value for value in symbol.groups() if value) if symbol else "unknown"
+            if name in ("scf.for", "scf.while", "scf.if"):
+                active_controls.append((indent, number, line.strip()))
+            elif line.lstrip().startswith("} else"):
+                previous = popped[-1] if popped else None
+                label = f"else of L{previous[1]}: {previous[2]}" if previous else "else branch (header not resolved)"
+                active_controls.append((indent, number, label))
+            definition = re.match(rf"\s*({ssa_pattern})(?::\d+)?\s*=", line)
+            loop_iv = re.search(rf"\bscf\.for\s+({ssa_pattern})\s*=", line)
+            if definition or loop_iv:
+                variable = (definition or loop_iv).group(1)
+                definitions[scope, variable] = (number, line.rstrip())
+            if name is None:
+                continue
+            operands = sync_operands(line)
+            if operands is not None or is_sync_operation(name):
+                text = f"{name} sync_related_args({operands})" if operands is not None else line.strip()
+                key = (scope, tuple((line_number, header) for _, line_number, header in active_controls))
+                context_id = control_paths.setdefault(key, f"C{len(control_paths)}")
+                refs = re.findall(ssa_pattern, text)
+                refs += [variable for _, _, header in active_controls for variable in re.findall(ssa_pattern, header)]
+                events.append((scope, number, context_id, text, refs))
+    pending = [(scope, variable, 0) for scope, _, _, _, refs in events for variable in refs]
+    visited, selected, unresolved = set(), {}, set()
+    while pending:
+        scope, variable, depth = pending.pop()
+        if (scope, variable) in visited:
+            continue
+        visited.add((scope, variable))
+        definition = definitions.get((scope, variable)) or definitions.get((scope, variable.split("#", 1)[0]))
+        if definition is None:
+            unresolved.add(f"F{scope}:{variable}")
+            continue
+        number, line = definition
+        selected[scope, number] = line
+        if depth < 4:
+            pending.extend((scope, other, depth + 1) for other in re.findall(ssa_pattern, line) if other != variable)
+    return {
+        "functions": functions,
+        "control_contexts": [
+            f"{context_id} [F{scope}]: "
+            + (" > ".join(f"L{number}: {text}" for number, text in headers) or "function level")
+            for (scope, headers), context_id in control_paths.items()
+        ],
+        "events": [f"L{number} [F{scope}/{context_id}] {text}" for scope, number, context_id, text, _ in events],
+        "definitions": [
+            f"L{number} [F{scope}] {line[:MAX_IR_SNIPPET_CHARS]}"
+            + (" [line shortened]" if len(line) > MAX_IR_SNIPPET_CHARS else "")
+            for (scope, number), line in sorted(selected.items())
+        ],
+        "unresolved": sorted(unresolved),
+    }
+
+
 def summarize_ir(path):
     """Stream counts plus first/last snippets; never infer runtime deadlock.
 
@@ -279,16 +379,12 @@ def summarize_ir(path):
     with path.open(encoding="utf-8", errors="replace") as handle:
         for total_lines, line in enumerate(handle, 1):
             # Match instructions, not #hivm.address_space/type attributes.
-            op = re.match(
-                r'^\s*(?:%[^=]*=\s*)?"?(hivm(?:\.[A-Za-z0-9_]+)+|scf\.(?:for|if|while|yield)|func\.(?:func|return))'
-                r'(?:"\s*\(|\s|\()',
-                line,
-            )
-            if not op:
+            name = ir_operation(line)
+            if name is None:
                 continue
-            name = op.group(1)
             counts[name] += 1
-            if any(token in name.lower() for token in ("sync", "set_flag", "wait_flag", "barrier")):
+            operands = sync_operands(line)
+            if operands is not None or is_sync_operation(name):
                 kind = "sync"
             elif name.startswith("scf."):
                 kind = "loops"
@@ -299,6 +395,8 @@ def summarize_ir(path):
             else:
                 continue
             text = line.rstrip()
+            if operands is not None:
+                text = f"{name} sync_related_args({operands})"
             symbol = re.search(r'sym_name\s*=\s*"([^"]+)"', text)
             if kind == "functions" and symbol:
                 text = f"func.func sym_name={symbol.group(1)}"
@@ -332,7 +430,7 @@ def choose_backend_ir(directory, commands):
     return None
 
 
-def paste_report(root, case="all", max_chars=DEFAULT_PASTE_CHARS):
+def paste_report(root, case="all", max_chars=DEFAULT_PASTE_CHARS, sync_details=False):
     root = root.resolve(strict=True)
     manifest = read_optional_json(root / "manifest.json", {})
     header = [
@@ -407,9 +505,20 @@ def paste_report(root, case="all", max_chars=DEFAULT_PASTE_CHARS):
                 f"source lines: {summary['lines']}",
                 "static op counts: " + json.dumps(summary["static_op_counts"]),
             ]
-            for kind in ("functions", "sync", "loops", "compute"):
-                lines.append(f"{kind}: first/last samples (not the complete IR)")
-                lines.extend(summary["samples"][kind])
+            if sync_details:
+                context = sync_context(path)
+                lines.append("function scopes: " + json.dumps(context["functions"]))
+                lines.append("enclosing control contexts (pretty-printed IR indentation, not path feasibility):")
+                lines.extend(context["control_contexts"])
+                lines.append("sync instructions + macro sync operands (source order; not runtime counts):")
+                lines.extend(context["events"])
+                lines.append("referenced SSA definitions / loop induction variables (dependency depth <=4):")
+                lines.extend(context["definitions"])
+                lines.append("unresolved SSA values: " + json.dumps(context["unresolved"]))
+            else:
+                for kind in ("functions", "sync", "loops", "compute"):
+                    lines.append(f"{kind}: first/last samples (not the complete IR)")
+                    lines.extend(summary["samples"][kind])
         sections.append(limited_text("\n".join(lines), case_budget))
     return limited_text("\n".join(header + sections), max_chars)
 
@@ -417,7 +526,7 @@ def paste_report(root, case="all", max_chars=DEFAULT_PASTE_CHARS):
 def main(argv=None):
     args = parse_args(argv)
     if args.paste:
-        print(paste_report(args.output, args.paste_case, args.paste_max_chars))
+        print(paste_report(args.output, args.paste_case, args.paste_max_chars, args.paste_sync))
         return
     if args.worker:
         print(json.dumps(worker(args), indent=2))
