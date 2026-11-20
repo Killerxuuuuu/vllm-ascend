@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A3 structural experiment: persistent tiles, paired K panels, one acc.
 
-Uses standard Triton, not A5-only UB->L1 copy APIs. Cache panels are source
+Uses Triton-Ascend slicing, not A5-only UB->L1 copy APIs. Cache panels are source
 SSA values; physical L1/L0 placement and asynchronous overlap must be verified
 in generated IR/profiling. No production dispatch or V1 defaults are changed.
 """
@@ -13,6 +13,7 @@ import torch_npu
 from vllm.triton_utils import tl, triton
 
 from vllm_ascend.ops.triton.transpose_quant_batch_matmul import PreparedDynamicWoA, PreparedTQBMM
+from vllm_ascend.ops.triton.triton_utils import extract_slice
 
 MAX_LOGICAL_ACCUMULATOR_BYTES = 64 * 1024
 MAX_PANEL_K = 512
@@ -69,19 +70,6 @@ def _v2_load_panel(
 
 
 @triton.jit
-def _v2_split_panel_halves(a_panel, b_panel, BM: tl.constexpr, BN: tl.constexpr, HALF_K: tl.constexpr):
-    # Move the two *contiguous K halves* to the final, size-two axis. split
-    # lowers to static extract_slice operations, not indexed gather/scalar
-    # tensor extraction. These are SSA shape/layout ops; physical movement
-    # remains a compiler decision and must be checked in the generated IR.
-    a_halves = tl.permute(tl.reshape(a_panel, (BM, 2, HALF_K)), (0, 2, 1))
-    b_halves = tl.permute(tl.reshape(b_panel, (2, HALF_K, BN)), (1, 2, 0))
-    a_low, a_high = tl.split(a_halves)
-    b_low, b_high = tl.split(b_halves)
-    return a_low, b_low, a_high, b_high
-
-
-@triton.jit
 def _v2_panel_subtile(
     a_panel,
     b_panel,
@@ -98,19 +86,12 @@ def _v2_panel_subtile(
     if PANEL_K == DOT_K:
         return a_panel, b_panel
     else:
-        a_low, b_low, a_high, b_high = _v2_split_panel_halves(a_panel, b_panel, BM, BN, PANEL_K // 2)
-        if MICRO < PANEL_K // DOT_K // 2:
-            a_half, b_half = a_low, b_low
-        else:
-            a_half, b_half = a_high, b_high
-        if PANEL_K == 2 * DOT_K:
-            return a_half, b_half
-        else:
-            a_first, b_first, a_second, b_second = _v2_split_panel_halves(a_half, b_half, BM, BN, DOT_K)
-            if MICRO % 2 == 0:
-                return a_first, b_first
-            else:
-                return a_second, b_second
+        # Keep N (B) and K (A) innermost. Moving a size-two split axis to
+        # the end made A3 pad each i8 lane to 32 bytes in UB.
+        start: tl.constexpr = MICRO * DOT_K
+        a = extract_slice(a_panel, (0, start), (BM, DOT_K), (1, 1))
+        b = extract_slice(b_panel, (start, 0), (DOT_K, BN), (1, 1))
+        return a, b
 
 
 @triton.jit

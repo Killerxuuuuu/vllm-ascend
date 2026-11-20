@@ -49,17 +49,10 @@ class V2Language(Language):
         raise AssertionError("V2 static panel slicing must not use gather")
 
     @staticmethod
-    def reshape(array, shape):
-        return np.reshape(array, shape).view(Array)
-
-    @staticmethod
-    def permute(array, dimensions):
-        return np.transpose(array, dimensions).view(Array)
-
-    @staticmethod
-    def split(array):
-        assert array.shape[-1] == 2
-        return array[..., 0].view(Array), array[..., 1].view(Array)
+    def extract_slice(array, offsets, sizes, strides):
+        assert array.ndim == len(offsets) == len(sizes) == 2
+        assert strides == (1, 1)
+        return array[tuple(slice(start, start + size) for start, size in zip(offsets, sizes))]
 
 
 def test_static_range_rejects_tensor_cdiv_result():
@@ -105,7 +98,7 @@ def load_kernel_namespace(language):
             for argument in node.args.args:
                 argument.annotation = None
             nodes.append(node)
-    namespace = {"tl": language, "GROUP_SIZE_M": 4}
+    namespace = {"tl": language, "GROUP_SIZE_M": 4, "extract_slice": language.extract_slice}
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(SOURCE), "exec"), namespace)
     return namespace
 
@@ -119,7 +112,7 @@ def load_kernels(language):
 @pytest.mark.parametrize("transposed", [False, True])
 @pytest.mark.parametrize("signed", [False, True])
 def test_static_panel_subtiles_preserve_exact_int8_k_order(block_shape, panel_ratio, transposed, signed):
-    """Execute the real split/reshape/permute helpers, including quarter order.
+    """Execute the kernel's offset/shape selection, including quarter order.
 
     No compiler or device claim: these tests establish exact byte selection
     for all supported panel ratios, full-range INT8, and both W layouts.
@@ -150,18 +143,17 @@ def test_static_panel_subtiles_preserve_exact_int8_k_order(block_shape, panel_ra
 def test_panel_slicing_has_no_indexed_gathers_or_dtype_conversions():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
-    for name in ("_v2_split_panel_halves", "_v2_panel_subtile", "_v2_dot_panel"):
+    for name in ("_v2_panel_subtile", "_v2_dot_panel"):
         calls = [node for node in ast.walk(functions[name]) if isinstance(node, ast.Call)]
         assert not any(
-            isinstance(node.func, ast.Attribute) and node.func.attr in ("gather", "to", "cast", "bitcast")
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("gather", "to", "cast", "bitcast", "split", "permute")
             for node in calls
         )
-    helper_calls = {
-        node.func.attr
-        for node in ast.walk(functions["_v2_split_panel_halves"])
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    }
-    assert helper_calls == {"reshape", "permute", "split"}
+    calls = [node for node in ast.walk(functions["_v2_panel_subtile"]) if isinstance(node, ast.Call)]
+    assert len(calls) == 2 and all(
+        isinstance(node.func, ast.Name) and node.func.id == "extract_slice" for node in calls
+    )
 
 
 @pytest.mark.parametrize(
