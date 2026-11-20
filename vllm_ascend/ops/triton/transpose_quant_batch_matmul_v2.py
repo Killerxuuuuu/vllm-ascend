@@ -150,6 +150,9 @@ def _transpose_quant_batch_matmul_v2_kernel(
     num_tiles: tl.constexpr = ((T + BM - 1) // BM) * ((N + BN - 1) // BN)
     full_panels: tl.constexpr = K // PANEL_K
     tail_k: tl.constexpr = K % PANEL_K
+    # A single-dot tail can load the dot operands directly. In particular,
+    # K=32, DOT_K=64 need not materialize and slice a masked 128-wide panel.
+    tail_width: tl.constexpr = DOT_K if tail_k <= DOT_K else PANEL_K
     panels_per_step: tl.constexpr = 2 if PREFETCH else 1
     for tile in range(pid, num_tiles, PROGRAMS):
         rows, cols = _v2_coordinates(tile, T, N, BM, BN)
@@ -226,9 +229,7 @@ def _transpose_quant_batch_matmul_v2_kernel(
             )
             acc = _v2_dot_panel(a_odd, b_odd, acc, BM, BN, DOT_K, PANEL_K, PANEL_K)
         if tail_k:
-            # A partial panel is separate for BOTH prefetch modes. Preserve the
-            # requested panel width, but only compute ceil(remaining K/DOT_K)
-            # subtiles; never pass an entirely padding K tile to dot.
+            # Mask against logical K even when X/W are views of larger storage.
             a_tail, b_tail = _v2_load_panel(
                 x_ptr,
                 w_ptr,
@@ -245,9 +246,9 @@ def _transpose_quant_batch_matmul_v2_kernel(
                 SWG,
                 SWK,
                 SWN,
-                PANEL_K,
+                tail_width,
             )
-            acc = _v2_dot_panel(a_tail, b_tail, acc, BM, BN, DOT_K, PANEL_K, tail_k)
+            acc = _v2_dot_panel(a_tail, b_tail, acc, BM, BN, DOT_K, tail_width, tail_k)
         sx = tl.load(sx_ptr + rows * SSXT + group * SSXG, mask=rows < T, other=0)
         sw = tl.load(sw_ptr + group * SSWG + cols * SSWN, mask=cols < N, other=0)
         result = (acc.to(tl.float32) * sw[None, :]) * sx[:, None]

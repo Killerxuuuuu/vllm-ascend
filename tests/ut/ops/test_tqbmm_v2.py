@@ -208,13 +208,16 @@ def test_panel_pairs_load_ahead_once_and_handle_single_odd_tails(inner, prefetch
     sw = np.ones((1, 1), dtype=np.float32)
     actual = np.full((1, 1, 1), np.nan, dtype=np.float32)
     events = []
+    load_widths = {"A": [], "B": []}
 
     class TraceLanguage(V2Language):
         def load(self, pointer, mask, other):
             if np.shares_memory(pointer.storage, x):
                 events.append("load_A")
+                load_widths["A"].append(pointer.offset.shape[1])
             elif np.shares_memory(pointer.storage, w):
                 events.append("load_B")
+                load_widths["B"].append(pointer.offset.shape[0])
             return super().load(pointer, mask, other)
 
         def dot(self, a, b, acc, out_dtype):
@@ -236,6 +239,10 @@ def test_panel_pairs_load_ahead_once_and_handle_single_odd_tails(inner, prefetch
     if tail_k:
         expected_events += ["load_A", "load_B"] + ["dot"] * Language.cdiv(tail_k, dot_k)
     assert events == expected_events
+    expected_widths = [panel_k] * full_panels
+    if tail_k:
+        expected_widths.append(dot_k if tail_k <= dot_k else panel_k)
+    assert load_widths["A"] == load_widths["B"] == expected_widths
     assert events.count("dot") == Language.cdiv(inner, dot_k)
     assert actual[0, 0, 0] == inner
 
