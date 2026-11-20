@@ -49,6 +49,12 @@ CPU 检查覆盖源码和数学逻辑，实际布局转换仍须通过 A3 编译
 CPU 回归检查 dot 次数等于 `ceil(K / DOT_K)`，并覆盖 K=1/32/65/129/257 等尾块。
 这一改动消除了无效计算；设备等待的后端同步原因需结合 A3 复测及 IR 确认。
 
+尾块实现随后暴露了前端常量错误：`tl.static_range(tl.cdiv(...))` 的循环边界是
+Tensor 标量 `int32[]`，不是编译期整数。现将其改为显式 `tl.constexpr` 的纯整数上取整。
+面板计数、尾块长度、输出 tile 数也显式标注 `tl.constexpr`，避免普通赋值被转换为 Tensor，
+使本应被编译期删除的分支仍进入编译。CPU 模拟器现在将 `tl.cdiv` 返回值模拟为 Tensor 标量，
+并拒绝它作为 static_range 边界；另有 AST 检查保护 constexpr 声明。
+
 ## 文件
 
 - `vllm_ascend/ops/triton/transpose_quant_batch_matmul_v2.py`：独立 kernel 和 prepared 接口。

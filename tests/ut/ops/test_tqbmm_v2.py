@@ -24,7 +24,17 @@ def host(monkeypatch):
 
 
 class V2Language(Language):
-    static_range = staticmethod(range)
+    @staticmethod
+    def cdiv(x, y):
+        # Match tl.cdiv's tensor return, not Python integer division. A plain
+        # int result here previously hid the device static_range compile bug.
+        return np.asarray((x + y - 1) // y, dtype=np.int32).view(Array)
+
+    @staticmethod
+    def static_range(*bounds):
+        if any(type(value) is not int for value in bounds):
+            raise TypeError("static_range requires compile-time integers, not Tensor scalars")
+        return range(*bounds)
 
     @staticmethod
     def where(condition, lhs, rhs):
@@ -37,6 +47,41 @@ class V2Language(Language):
     @staticmethod
     def gather(array, indices, axis):
         return np.take_along_axis(array, indices, axis).view(Array)
+
+
+def test_static_range_rejects_tensor_cdiv_result():
+    language = V2Language(0, 0)
+    with pytest.raises(TypeError, match="compile-time integers"):
+        language.static_range(language.cdiv(32, 64))
+    assert list(language.static_range((32 + 64 - 1) // 64)) == [0]
+
+
+def test_shape_control_and_micro_loop_bound_are_explicit_constexpr():
+    """NumPy cannot model Triton's unannotated-Assign conversion to tensors.
+
+    Protect that compiler contract directly as well as executing arithmetic.
+    AnnAssign constexpr values must be pure arithmetic, without JIT tl.cdiv.
+    """
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    for function_name, required in (
+        ("_v2_dot_panel", {"micro_tiles"}),
+        ("_transpose_quant_batch_matmul_v2_kernel", {"num_tiles", "full_panels", "tail_k", "panels_per_step"}),
+    ):
+        function = functions[function_name]
+        constants = {
+            node.target.id: node
+            for node in function.body
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+        }
+        assert required <= constants.keys()
+        for name in required:
+            node = constants[name]
+            assert isinstance(node.annotation, ast.Attribute) and node.annotation.attr == "constexpr"
+            assert isinstance(node.annotation.value, ast.Name) and node.annotation.value.id == "tl"
+            assert not any(isinstance(value, ast.Call) for value in ast.walk(node.value))
+    micro_loop = next(node for node in ast.walk(functions["_v2_dot_panel"]) if isinstance(node, ast.For))
+    assert ast.unparse(micro_loop.iter) == "tl.static_range(micro_tiles)"
 
 
 def load_kernels(language):

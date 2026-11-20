@@ -82,7 +82,10 @@ def _v2_dot_panel(
     # Keep the original K order and INT32 accumulation/FP32 scaling contract.
     # Do not emit dot operations whose entire K subtile is padding. ACTIVE_K
     # is compile-time: the tail is specialized, not a runtime branch on Cube.
-    for micro in tl.static_range(tl.cdiv(ACTIVE_K, DOT_K)):
+    # tl.cdiv is a JIT tensor operation, even for literal inputs. Keep this
+    # arithmetic in constexpr space so static_range never receives int32[].
+    micro_tiles: tl.constexpr = (ACTIVE_K + DOT_K - 1) // DOT_K
+    for micro in tl.static_range(micro_tiles):
         if PANEL_K == DOT_K:
             a, b = a_panel, b_panel
         else:
@@ -123,8 +126,9 @@ def _transpose_quant_batch_matmul_v2_kernel(
 ):
     pid = tl.program_id(0)
     group = tl.program_id(1).to(tl.int64)
-    num_tiles = tl.cdiv(T, BM) * tl.cdiv(N, BN)
-    full_panels = K // PANEL_K
+    num_tiles: tl.constexpr = ((T + BM - 1) // BM) * ((N + BN - 1) // BN)
+    full_panels: tl.constexpr = K // PANEL_K
+    tail_k: tl.constexpr = K % PANEL_K
     panels_per_step: tl.constexpr = 2 if PREFETCH else 1
     for tile in range(pid, num_tiles, PROGRAMS):
         rows, cols = _v2_coordinates(tile, T, N, BM, BN)
@@ -200,7 +204,7 @@ def _transpose_quant_batch_matmul_v2_kernel(
                 PANEL_K,
             )
             acc = _v2_dot_panel(a_odd, b_odd, acc, BM, BN, DOT_K, PANEL_K, PANEL_K)
-        if K % PANEL_K:
+        if tail_k:
             # A partial panel is separate for BOTH prefetch modes. Preserve the
             # requested panel width, but only compute ceil(remaining K/DOT_K)
             # subtiles; never pass an entirely padding K tile to dot.
@@ -222,7 +226,7 @@ def _transpose_quant_batch_matmul_v2_kernel(
                 SWN,
                 PANEL_K,
             )
-            acc = _v2_dot_panel(a_tail, b_tail, acc, BM, BN, DOT_K, PANEL_K, K % PANEL_K)
+            acc = _v2_dot_panel(a_tail, b_tail, acc, BM, BN, DOT_K, PANEL_K, tail_k)
         sx = tl.load(sx_ptr + rows * SSXT + group * SSXG, mask=rows < T, other=0)
         sw = tl.load(sw_ptr + group * SSWG + cols * SSWN, mask=cols < N, other=0)
         result = (acc.to(tl.float32) * sw[None, :]) * sx[:, None]
