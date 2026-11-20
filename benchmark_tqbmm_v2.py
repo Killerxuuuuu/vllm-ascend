@@ -251,7 +251,11 @@ def worker(args):
             "weight_stride": list(weight.stride()),
             "v1": v1_options(),
             "v2": asdict(config),
-            "v2_prefetch_scheme": "paired full panels; specialized partial K tail; no loop-carried panels",
+            "v2_prefetch_scheme": (
+                "paired full panels"
+                if tokens % config.block_shape[0] == columns % config.block_shape[1] == inner % config.panel_k == 0
+                else "paired direct dot-width loads"
+            ),
             "persistent_cores": prequantized["v2"]._cores,
             "logical_accumulator_bytes": config.block_shape[0] * config.block_shape[1] * 4,
             "memory_placement": "compiler-managed; panels/prefetch do not guarantee physical L1/overlap",

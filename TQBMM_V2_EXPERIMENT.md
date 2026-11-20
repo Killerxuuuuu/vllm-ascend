@@ -6,8 +6,8 @@
 
 | 调整 | V2 实现 | 对照方式 |
 | --- | --- | --- |
-| 搬运粒度与计算粒度分离 | 加载 `PANEL_K` 宽的输入面板，拆为多个 `DOT_K` 块进行 INT8 dot | 保持 dot tile 不变，比较 panel K=64/128/256 |
-| 搬运与计算交叠机会 | 在同一轮内先加载相邻两个 K 面板，再依次计算；面板不跨循环传递 | `v2` 对比 `v2_no_prefetch` |
+| 搬运粒度与计算粒度分离 | 完整分块形状保留 `PANEL_K` 宽加载；带边界的形状按 `DOT_K` 直接加载 | 保持 dot tile 不变，分别比较完整分块和边界形状 |
+| 搬运与计算交叠机会 | 开启预取时，宽路径先读两个面板，边界路径先读两组 dot 操作数，再依次计算 | `v2` 对比 `v2_no_prefetch` |
 | 限制累加器生命周期 | 每个 persistent program 顺序处理多个输出 tile，每次仅保留一份 INT32 accumulator | 记录逻辑 accumulator 字节数，检查 IR 中 CC 分配 |
 
 默认 dot tile 为 `(64,64,64)`，panel K=128，stages=2，逻辑累加器为 16 KiB。
@@ -54,6 +54,20 @@ Tensor 标量 `int32[]`，不是编译期整数。现将其改为显式 `tl.cons
 面板计数、尾块长度、输出 tile 数也显式标注 `tl.constexpr`，避免普通赋值被转换为 Tensor，
 使本应被编译期删除的分支仍进入编译。CPU 模拟器现在将 `tl.cdiv` 返回值模拟为 Tensor 标量，
 并拒绝它作为 static_range 边界；另有 AST 检查保护 constexpr 声明。
+
+### 当前实现：正确性与性能分开验收
+
+形状分流在编译期完成：当 `T % BM == 0`、`N % BN == 0`、`K % PANEL_K == 0` 同时成立时，
+保留宽面板加载。其余形状直接按绝对 K 地址加载 dot 操作数，包括其中的完整 K 面板。
+例如 `[67,2,4096,65]` 的 K 虽然整除，M/N 边界仍需要掩码，不会走宽面板切片。
+两条路径使用相同的 INT32 累加和缩放顺序，不额外复制、补齐权重或增加 kernel launch。
+
+先跑完整 V2 单卡 pytest，再关闭 profiler，在同一空闲 A3 上分别从旧版和新版运行下方基准，
+固定权重、分块、seed、迭代和 Graph batch size，分别保存到新目录。
+建议加测 `--tokens 32 512 513 1024 8192`：512/513 跨过一个 M 边界，8192 检查大 T 吞吐。
+对照各自 `timings.csv` 中同 T、seed、mode、domain 的 `implementation=v2` 的 `median_ms`；
+同场 `composition` 用于检查卡的状态是否漂移，不代替旧 V2 的性能基线。
+任何数值失败的版本/形状不参与速度排名。
 
 ## 文件
 

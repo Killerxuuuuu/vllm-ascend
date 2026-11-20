@@ -45,7 +45,29 @@ def _run_plan_to_cpu_with_stages(plan):
 @pytest.mark.parametrize("transposed", [False, True])
 @pytest.mark.parametrize("span", [(0, 32), (32, 97), (0, 4096), (0, 129), (32, 289)])
 def test_v2_integer_golden_and_persistent_tails(prefetch, panel_k, transposed, span):
-    t, g, physical_k, n = 67, 2, 4096, 65
+    _check_integer_golden(67, 65, span, transposed, V2Config((32, 32, 64), panel_k, prefetch, programs=3))
+
+
+@pytest.mark.parametrize(
+    "t,n,k,panel_k,prefetch,programs,stages,transposed",
+    [
+        # Same data as the reported failure, varying one scheduling axis.
+        (67, 65, 4096, 128, False, 3, 2, False),
+        (67, 65, 4096, 128, True, 3, 1, False),
+        (67, 65, 4096, 128, True, 9, 2, False),  # one tile/program/group
+        # Fully tiled wide loads: exercise both weight layouts, not just the boundary path.
+        (64, 96, 4096, 128, True, 3, 2, False),
+        (64, 96, 4096, 256, True, 3, 2, True),
+        (64, 96, 384, 128, True, 3, 2, False),  # unpaired last full panel
+        (64, 96, 384, 128, False, 3, 2, True),
+    ],
+)
+def test_v2_schedule_controls(t, n, k, panel_k, prefetch, programs, stages, transposed):
+    _check_integer_golden(t, n, (0, k), transposed, V2Config((32, 32, 64), panel_k, prefetch, programs, stages))
+
+
+def _check_integer_golden(t, n, span, transposed, config):
+    g, physical_k = 2, 4096
     torch.manual_seed(0)
     x_cpu = torch.randint(-8, 9, (t, g, physical_k), dtype=torch.int8, device="cpu")
     w_cpu = torch.randint(-8, 9, (g, n, physical_k), dtype=torch.int8, device="cpu")
@@ -57,7 +79,7 @@ def test_v2_integer_golden_and_persistent_tails(prefetch, panel_k, transposed, s
     )
     assert expected.device.type == "cpu"
     print(
-        f"[tqbmm-v2] cpu-golden.done span={span} transposed={transposed} panel_k={panel_k} prefetch={prefetch}",
+        f"[tqbmm-v2] cpu-golden.done span={span} transposed={transposed} config={config}",
         flush=True,
     )
     x = x_cpu.npu()[:, :, start:end]
@@ -70,10 +92,26 @@ def test_v2_integer_golden_and_persistent_tails(prefetch, panel_k, transposed, s
         torch.ones(t, g, dtype=torch.float32, device="npu"),
         torch.ones(g, n, dtype=torch.float32, device="npu"),
         output_dtype=torch.float32,
-        config=V2Config((32, 32, 64), panel_k, prefetch, programs=3, num_stages=2),
+        config=config,
     )
+    # Test-only marker; avoid a false pass from a previous output in recycled memory.
+    plan.output.fill_(float("nan"))
     actual = _run_plan_to_cpu_with_stages(plan)
     print("[tqbmm-v2] compare.begin", flush=True)
+    bad = (actual != expected).nonzero()
+    if bad.numel():
+        bm, bn, _ = config.block_shape
+        tiles = bad.clone()
+        tiles[:, 0] //= bm
+        tiles[:, 2] //= bn
+        unique, counts = torch.unique(tiles, dim=0, return_counts=True)
+        first = tuple(bad[0].tolist())
+        print(
+            f"[tqbmm-v2] first={first} actual={actual[first].item()} expected={expected[first].item()} "
+            f"nan_after_write={actual.isnan().sum().item()} "
+            f"bad_by_tile(m,g,n)={list(zip(unique.tolist(), counts.tolist()))}",
+            flush=True,
+        )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     print("[tqbmm-v2] compare.done", flush=True)
 

@@ -37,20 +37,7 @@ class V2Language(Language):
         return range(*bounds)
 
     @staticmethod
-    def where(condition, lhs, rhs):
-        return np.asarray(np.where(condition, lhs, rhs)).view(Array)
-
-    @staticmethod
-    def broadcast_to(array, shape):
-        return np.broadcast_to(array, shape).view(Array)
-
-    @staticmethod
-    def gather(array, indices, axis):
-        raise AssertionError("V2 static panel slicing must not use gather")
-
-    @staticmethod
     def extract_slice(array, offsets, sizes, strides):
-        assert array.ndim == len(offsets) == len(sizes) == 2
         assert strides == (1, 1)
         return array[tuple(slice(start, start + size) for start, size in zip(offsets, sizes))]
 
@@ -71,13 +58,13 @@ def test_shape_control_and_micro_loop_bound_are_explicit_constexpr():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
     for function_name, required in (
-        ("_v2_dot_panel", {"micro_tiles"}),
-        ("_transpose_quant_batch_matmul_v2_kernel", {"num_tiles", "full_panels", "tail_k", "panels_per_step"}),
+        ("_v2_accumulate_panel", {"micro_tiles", "issue_width"}),
+        ("_transpose_quant_batch_matmul_v2_kernel", {"wide", "num_tiles", "step_k", "full_steps", "tail_k"}),
     ):
         function = functions[function_name]
         constants = {
             node.target.id: node
-            for node in function.body
+            for node in ast.walk(function)
             if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
         }
         assert required <= constants.keys()
@@ -86,8 +73,8 @@ def test_shape_control_and_micro_loop_bound_are_explicit_constexpr():
             assert isinstance(node.annotation, ast.Attribute) and node.annotation.attr == "constexpr"
             assert isinstance(node.annotation.value, ast.Name) and node.annotation.value.id == "tl"
             assert not any(isinstance(value, ast.Call) for value in ast.walk(node.value))
-    micro_loop = next(node for node in ast.walk(functions["_v2_dot_panel"]) if isinstance(node, ast.For))
-    assert ast.unparse(micro_loop.iter) == "tl.static_range(micro_tiles)"
+    micro_loop = next(node for node in ast.walk(functions["_v2_accumulate_panel"]) if isinstance(node, ast.For))
+    assert ast.unparse(micro_loop.iter) == "tl.static_range(micro_tiles // issue_width)"
 
 
 def load_kernel_namespace(language):
@@ -111,7 +98,7 @@ def load_kernels(language):
 @pytest.mark.parametrize("panel_ratio", [1, 2, 4])
 @pytest.mark.parametrize("transposed", [False, True])
 @pytest.mark.parametrize("signed", [False, True])
-def test_static_panel_subtiles_preserve_exact_int8_k_order(block_shape, panel_ratio, transposed, signed):
+def test_direct_loads_preserve_exact_int8_k_order(block_shape, panel_ratio, transposed, signed):
     """Execute the kernel's offset/shape selection, including quarter order.
 
     No compiler or device claim: these tests establish exact byte selection
@@ -126,11 +113,32 @@ def test_static_panel_subtiles_preserve_exact_int8_k_order(block_shape, panel_ra
         b = rng.integers(low, 128, (bn, panel_k), dtype=np.int8).T.view(Array)
     else:
         b = rng.integers(low, 128, (panel_k, bn), dtype=np.int8).view(Array)
-    subtile = load_kernel_namespace(V2Language(0, 0))["_v2_panel_subtile"]
+    namespace = load_kernel_namespace(V2Language(0, 0))
+    load = namespace["_v2_load_operands"]
+    rows = np.arange(bm).view(Array)
+    cols = np.arange(bn).view(Array)
+    # Pointer takes physical storage, not a flattened copy of a transposed view.
+    w_storage = b.T if transposed else b
     a_parts, b_parts = [], []
     for micro in range(panel_ratio):
-        actual_a, actual_b = subtile(a, b, bm, bn, dot_k, panel_k, micro)
         k_start = micro * dot_k
+        actual_a, actual_b = load(
+            Pointer(a),
+            Pointer(w_storage),
+            rows,
+            cols,
+            0,
+            k_start,
+            bm,
+            panel_k,
+            bn,
+            panel_k,
+            0,
+            1,
+            0,
+            *b.strides,
+            dot_k,
+        )
         np.testing.assert_array_equal(actual_a, a[:, k_start : k_start + dot_k])
         np.testing.assert_array_equal(actual_b, b[k_start : k_start + dot_k, :])
         assert actual_a.dtype == actual_b.dtype == np.int8
@@ -138,22 +146,24 @@ def test_static_panel_subtiles_preserve_exact_int8_k_order(block_shape, panel_ra
         b_parts.append(actual_b)
     np.testing.assert_array_equal(np.concatenate(a_parts, axis=1), a)
     np.testing.assert_array_equal(np.concatenate(b_parts, axis=0), b)
+    wide_result = namespace["_v2_dot_full_panel"](a, b, Language.zeros((bm, bn), np.int32), dot_k, panel_k)
+    np.testing.assert_array_equal(wide_result, a.astype(np.int64) @ b.astype(np.int64))
 
 
-def test_panel_slicing_has_no_indexed_gathers_or_dtype_conversions():
+def test_dot_operands_are_direct_loads():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
-    for name in ("_v2_panel_subtile", "_v2_dot_panel"):
-        calls = [node for node in ast.walk(functions[name]) if isinstance(node, ast.Call)]
+    load = functions["_v2_load_operands"]
+    ret = next(node for node in load.body if isinstance(node, ast.Return))
+    assignments = {ast.unparse(node.targets[0]): node.value for node in load.body if isinstance(node, ast.Assign)}
+    assert all(ast.unparse(assignments[name.id].func) == "tl.load" for name in ret.value.elts)
+    # No slice/gather in the direct-load code; the aligned helper can slice.
+    for fn in (load, functions["_v2_accumulate_panel"]):
         assert not any(
-            isinstance(node.func, ast.Attribute)
-            and node.func.attr in ("gather", "to", "cast", "bitcast", "split", "permute")
-            for node in calls
+            isinstance(node, ast.Call)
+            and ast.unparse(node.func) in {"extract_slice", "tl.gather", "tl.split", "tl.permute"}
+            for node in ast.walk(fn)
         )
-    calls = [node for node in ast.walk(functions["_v2_panel_subtile"]) if isinstance(node, ast.Call)]
-    assert len(calls) == 2 and all(
-        isinstance(node.func, ast.Name) and node.func.id == "extract_slice" for node in calls
-    )
 
 
 @pytest.mark.parametrize(
@@ -197,6 +207,56 @@ def test_actual_v2_source_against_int64(shape, strided, prefetch, panel_ratio, p
     np.testing.assert_array_equal(actual, expected)
 
 
+@pytest.mark.parametrize("t,k,n", [(67, 4096, 65), (67, 32, 65), (64, 384, 96), (64, 257, 96), (64, 4096, 96)])
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_exact_tile_ownership_and_load_width(t, k, n, prefetch):
+    """Check both shape specializations, not just equality of final values."""
+    bm, bn, dot_k, panel_k, groups, programs = 32, 32, 64, 128, 2, 3
+    rng = np.random.default_rng(0)
+    x = rng.integers(-8, 9, (t, groups, k), dtype=np.int8)
+    w = rng.integers(-8, 9, (groups, k, n), dtype=np.int8)
+    sx = np.ones((t, groups), dtype=np.float32)
+    sw = np.ones((groups, n), dtype=np.float32)
+    actual = np.full((t, groups, n), np.nan, dtype=np.float32)
+    writes = np.zeros(actual.size, dtype=np.int32)
+    widths = []
+
+    class AuditLanguage(V2Language):
+        def store(self, pointer, value, mask):
+            offsets, valid = np.broadcast_arrays(pointer.offset, mask)
+            np.add.at(writes, offsets[valid], 1)
+            super().store(pointer, value, mask)
+
+        def load(self, pointer, mask, other):
+            if np.shares_memory(pointer.storage, w):
+                widths.append(pointer.offset.shape[0])
+            return super().load(pointer, mask, other)
+
+    strides = tuple(s // v.itemsize for v in (x, w, sx, sw) for s in v.strides)
+    for group in range(groups):
+        for pid in reversed(range(programs)):
+            load_kernels(AuditLanguage(pid, group))(
+                *map(Pointer, (x, w, sx, sw, actual)),
+                t,
+                groups,
+                k,
+                n,
+                *strides,
+                bm,
+                bn,
+                dot_k,
+                panel_k,
+                programs,
+                prefetch,
+            )
+    width = panel_k if t % bm == 0 and n % bn == 0 and k % panel_k == 0 else dot_k
+    tiles = groups * Language.cdiv(t, bm) * Language.cdiv(n, bn)
+    assert widths == [width] * (tiles * Language.cdiv(k, width))
+    np.testing.assert_array_equal(writes, 1)
+    golden = np.einsum("tgk,gkn->tgn", x.astype(np.int64), w.astype(np.int64))
+    np.testing.assert_array_equal(actual, golden)
+
+
 @pytest.mark.parametrize("inner", [1, 32, 64, 65, 128, 129, 192, 193, 256, 257, 513])
 @pytest.mark.parametrize("prefetch", [False, True])
 @pytest.mark.parametrize("panel_k,dot_k", [(64, 32), (128, 32), (64, 64), (128, 64), (256, 64)])
@@ -228,20 +288,16 @@ def test_panel_pairs_load_ahead_once_and_handle_single_odd_tails(inner, prefetch
     load_kernels(TraceLanguage(0, 0))(
         *map(Pointer, (x, w, sx, sw, actual)), 1, 1, inner, 1, *strides, 32, 32, dot_k, panel_k, 1, prefetch
     )
-    full_panels, tail_k = divmod(inner, panel_k)
-    panel_dots = ["dot"] * (panel_k // dot_k)
+    dot_count = Language.cdiv(inner, dot_k)
+    load_pair = ["load_A", "load_B"]
     if prefetch:
-        expected_events = (["load_A", "load_B", "load_A", "load_B"] + panel_dots * 2) * (full_panels // 2)
-        if full_panels % 2:
-            expected_events += ["load_A", "load_B"] + panel_dots
+        expected_events = (load_pair * 2 + ["dot", "dot"]) * (dot_count // 2)
+        if dot_count % 2:
+            expected_events += load_pair + ["dot"]
     else:
-        expected_events = (["load_A", "load_B"] + panel_dots) * full_panels
-    if tail_k:
-        expected_events += ["load_A", "load_B"] + ["dot"] * Language.cdiv(tail_k, dot_k)
+        expected_events = (load_pair + ["dot"]) * dot_count
     assert events == expected_events
-    expected_widths = [panel_k] * full_panels
-    if tail_k:
-        expected_widths.append(dot_k if tail_k <= dot_k else panel_k)
+    expected_widths = [dot_k] * dot_count
     assert load_widths["A"] == load_widths["B"] == expected_widths
     assert events.count("dot") == Language.cdiv(inner, dot_k)
     assert actual[0, 0, 0] == inner
@@ -380,29 +436,14 @@ def test_prefetch_never_carries_panel_tensors_between_loop_iterations():
     kernel = next(
         node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name.startswith("_transpose_")
     )
+    # Nested helper calls isolate operand lifetimes. The dynamic K loop
+    # returns only the accumulator, never a panel as an scf.for iter_arg.
     tile_loop = next(node for node in kernel.body if isinstance(node, ast.For))
-    before_tiles = kernel.body[: kernel.body.index(tile_loop)]
-    assert not any(
-        isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_v2_load_panel"
-        for statement in before_tiles
-        for node in ast.walk(statement)
-    )
-    panel_names = {"a_current", "b_current", "a_next", "b_next", "a_odd", "b_odd", "a_tail", "b_tail"}
-    assignments = [
-        node
-        for node in ast.walk(tile_loop)
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id in panel_names
-            for group in node.targets
-            for target in ast.walk(group)
-        )
-    ]
-    assert len(assignments) == 4
-    assert all(
-        isinstance(node.value, ast.Call) and getattr(node.value.func, "id", None) == "_v2_load_panel"
-        for node in assignments
-    )
+    k_loop = next(node for node in ast.walk(tile_loop) if isinstance(node, ast.For) and node is not tile_loop)
+    assert len(k_loop.body) == 1
+    update = k_loop.body[0]
+    assert isinstance(update, ast.Assign) and ast.unparse(update.targets[0]) == "acc"
+    assert ast.unparse(update.value.func) == "_v2_accumulate_panel"
 
 
 @pytest.mark.parametrize("failure", [None, "input-sync", "launch", "device-sync", "cpu-copy"])
