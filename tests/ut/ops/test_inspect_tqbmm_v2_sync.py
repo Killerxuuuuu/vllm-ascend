@@ -159,6 +159,7 @@ def test_parent_wraps_fresh_cache_and_exports_even_compile_failure(inspector, tm
         }
 
     monkeypatch.setattr(inspector, "run_worker", fake_run)
+    monkeypatch.setattr(inspector, "find_spec", lambda name: SimpleNamespace(origin="stub"))
     output = tmp_path / "result"
     with pytest.raises(SystemExit):
         inspector.main(["--output", str(output)])
@@ -166,3 +167,130 @@ def test_parent_wraps_fresh_cache_and_exports_even_compile_failure(inspector, tm
     assert result["run_status"] == "failed" and len(calls) == 3
     assert result["cases"][1]["compile_only"] == "failed"
     assert (output / "sync_ir_export.tar.gz").is_file()
+
+
+def test_missing_torch_npu_fails_before_creating_output_or_workers(inspector, tmp_path, monkeypatch):
+    output = tmp_path / "must-not-exist"
+    calls = []
+    monkeypatch.setattr(inspector, "find_spec", lambda name: None)
+    monkeypatch.setattr(inspector, "run_worker", lambda *args: calls.append(args))
+    with pytest.raises(SystemExit) as caught:
+        inspector.main(["--output", str(output)])
+    assert "torch_npu is unavailable" in str(caught.value)
+    assert sys.executable in str(caught.value)
+    assert not output.exists() and not calls
+
+
+def test_preflight_only_checks_module_visibility(inspector, monkeypatch):
+    calls = []
+    monkeypatch.setattr(inspector, "find_spec", lambda name: calls.append(name) or SimpleNamespace(origin="stub"))
+    inspector.check_python_environment()
+    assert calls == ["torch_npu"]
+
+
+def write_capture(directory, case):
+    directory.mkdir(parents=True)
+    (directory / "compile.json").write_text(
+        json.dumps(
+            {
+                "compile_only": "completed",
+                "case": case,
+                "shape_T_G_K_N": [67, 2, 4096, 65],
+                "options": {"PREFETCH": True, "num_stages": 2},
+                "backend_sync_ir_found": True,
+            }
+        )
+    )
+    (directory / "compiler_commands.json").write_text(
+        json.dumps(
+            [
+                {"prefix": "compiler-00", "returncode": 1, "command": ["bishengir-compile", "bad.mlir"]},
+                {
+                    "prefix": "compiler-01",
+                    "returncode": 0,
+                    "command": ["bishengir-compile", "good.mlir", "--enable-auto-multi-buffer=True"],
+                },
+            ]
+        )
+    )
+    (directory / "compiler-00.stderr.txt").write_text("hivm.hir.failed_old_attempt\n")
+    lines = ['"func.func"() <{sym_name = "kernel_mix_aic"}> ({\n', '  "scf.for"(%start, %end, %step) ({\n']
+    for flag in range(20):
+        lines += [
+            f'    "hivm.hir.sync_block_set"() <{{static_flag_id = {flag}}}>\n',
+            '    "hivm.hir.mmadL1"(%a, %b, %acc)\n',
+            f'    "hivm.hir.sync_block_wait"() <{{static_flag_id = {flag}}}>\n',
+        ]
+    lines += ['    "scf.yield"(%acc)\n', "  })\n", '  "func.return"()\n', "})\n"]
+    (directory / "compiler-01.stderr.txt").write_text("".join(lines))
+
+
+def test_paste_report_preserves_cases_counts_line_references_and_flags(inspector, tmp_path):
+    (tmp_path / "manifest.json").write_text(json.dumps({"run_status": "completed", "cases": []}))
+    for name in inspector.CASES:
+        write_capture(tmp_path / name, name)
+    report = inspector.paste_report(tmp_path)
+    assert len(report) <= inspector.DEFAULT_PASTE_CHARS
+    for name in inspector.CASES:
+        assert f"=== {name} ===" in report
+    assert "--enable-auto-multi-buffer=True" in report
+    assert '"hivm.hir.sync_block_set": 20' in report
+    assert "static_flag_id = 0" in report and "static_flag_id = 19" in report
+    assert "compiler-01.stderr.txt" in report
+    assert "hivm.hir.failed_old_attempt" not in report
+    assert "L3:" in report
+    assert "not the complete IR" in report
+
+
+def test_paste_report_distinguishes_import_failure_from_ir(inspector, tmp_path):
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_status": "failed",
+                "cases": [{"case": "prefetch_s2", "compile_only": "failed", "error": "Worker exit=1"}],
+            }
+        )
+    )
+    directory = tmp_path / "prefetch_s2"
+    directory.mkdir()
+    (directory / "compile.log").write_text("Traceback\nModuleNotFoundError: No module named 'torch_npu'\n")
+    report = inspector.paste_report(tmp_path, "prefetch_s2")
+    assert "NO BACKEND HIVM IR" in report
+    assert "ModuleNotFoundError" in report
+    assert "hivm.hir.sync" not in report
+
+
+def test_paste_mode_is_read_only_and_skips_npu_preflight(inspector, tmp_path, monkeypatch, capsys):
+    (tmp_path / "manifest.json").write_text("{}")
+
+    def forbidden():
+        raise AssertionError("paste must not check NPU environment")
+
+    monkeypatch.setattr(inspector, "check_python_environment", forbidden)
+    before = set(tmp_path.rglob("*"))
+    inspector.main(["--output", str(tmp_path), "--paste", "--paste-case", "prefetch_s2"])
+    assert "=== prefetch_s2 ===" in capsys.readouterr().out
+    assert set(tmp_path.rglob("*")) == before
+
+
+def test_single_case_large_output_is_explicitly_bounded(inspector, tmp_path):
+    (tmp_path / "manifest.json").write_text("{}")
+    write_capture(tmp_path / "prefetch_s2", "prefetch_s2")
+    (tmp_path / "prefetch_s2" / "compiler-01.stderr.txt").write_text(
+        ('"hivm.hir.sync_block_wait"() <{static_flag_id = 7, ' + "long_attribute " * 80 + "}>\n") * 20
+    )
+    report = inspector.paste_report(tmp_path, "prefetch_s2", max_chars=2000)
+    assert len(report) <= 2000
+    assert "TRUNCATED" in report
+    assert "=== prefetch_s2 ===" in report
+
+
+def test_ir_counts_do_not_count_types_or_attributes_as_operations(inspector, tmp_path):
+    path = tmp_path / "ir.mlir"
+    path.write_text(
+        '%a = "memref.alloc"() : () -> memref<32xi8, #hivm.address_space<cbuf>>\n'
+        "}) {hivm.func_core_type = #hivm.tcore_type<CUBE>}\n"
+        '  "hivm.hir.sync_block_wait"() <{static_flag_id = 1}>\n'
+    )
+    result = inspector.summarize_ir(path)
+    assert result["static_op_counts"] == {"hivm.hir.sync_block_wait": 1}

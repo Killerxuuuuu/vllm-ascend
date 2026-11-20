@@ -15,6 +15,8 @@ import re
 import subprocess
 import sys
 import tarfile
+from collections import Counter, deque
+from importlib.util import find_spec
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +26,9 @@ ROOT = Path(__file__).resolve().parent
 CASES = ("no_prefetch_s2", "prefetch_s1", "prefetch_s2")
 TEXT_SUFFIXES = (".json", ".log", ".txt", ".mlir", ".ttir", ".ttadapter", ".bcmlir", ".llir")
 SYNC_IR_FLAG = "--bishengir-print-ir-after=hivm-graph-sync-solver"
+DEFAULT_PASTE_CHARS = 18000
+PASTE_CONTEXT_SAMPLES = 3
+MAX_IR_SNIPPET_CHARS = 650
 
 
 def case_options(name):
@@ -32,9 +37,25 @@ def case_options(name):
     return {"prefetch": name != "no_prefetch_s2", "num_stages": 1 if name == "prefetch_s1" else 2}
 
 
+def check_python_environment():
+    """Fail before creating artifacts; workers use this exact interpreter.
+
+    This checks module visibility only, without importing torch, initializing
+    an NPU context or changing installed packages.
+    """
+    if find_spec("torch_npu") is None:
+        raise SystemExit(
+            f"torch_npu is unavailable in this interpreter: {sys.executable}\n"
+            "Run from the same vLLM container and Python environment as the NPU pytest run. "
+            "Use that interpreter explicitly; do not upgrade/install torch or torch_npu just for this collector."
+        )
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True, help="New directory; refuse to overwrite")
+    parser.add_argument(
+        "--output", type=Path, required=True, help="New capture directory, or existing directory with --paste"
+    )
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--tokens", type=int, default=67)
     parser.add_argument("--groups", type=int, default=2)
@@ -48,6 +69,11 @@ def parse_args(argv=None):
     parser.add_argument("--case", choices=CASES, help=argparse.SUPPRESS)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--paste", action="store_true", help="Read existing capture and print bounded text; no NPU needed"
+    )
+    parser.add_argument("--paste-case", choices=("all", *CASES), default="all")
+    parser.add_argument("--paste-max-chars", type=int, default=DEFAULT_PASTE_CHARS)
     args = parser.parse_args(argv)
     if min(args.tokens, args.groups, args.inner, args.columns, args.programs, args.timeout) < 1:
         parser.error("Dimensions/programs/timeout must be positive")
@@ -58,6 +84,10 @@ def parse_args(argv=None):
         parser.error("Require DOT_K>=32 and panel K=1/2/4 times DOT_K, <=512")
     if args.worker and not args.case:
         parser.error("--worker requires --case")
+    if args.paste and (args.worker or args.dry_run):
+        parser.error("--paste cannot be combined with --worker or --dry-run")
+    if args.paste_max_chars < 2000:
+        parser.error("--paste-max-chars must be >=2000")
     return args
 
 
@@ -128,6 +158,7 @@ def compiler_capture(original_run, output, records):
 def worker(args):
     # Compile-only dtype placeholders; no torch.empty/.to(), quantization,
     # .synchronize(), plan() or kernel[grid]() calls are allowed in this tool.
+    print(f"Worker Python: {sys.executable} (prefix={sys.prefix})", flush=True)
     import torch
     import torch_npu
 
@@ -221,8 +252,173 @@ def export_text(root):
     return archive
 
 
+def read_optional_json(path, default):
+    if not path.is_file():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as error:
+        return {"read_error": str(error)}
+
+
+def limited_text(value, limit):
+    marker = "\n[TRUNCATED: request a single --paste-case or the referenced source lines]\n"
+    return value if len(value) <= limit else value[: limit - len(marker)] + marker
+
+
+def summarize_ir(path):
+    """Stream counts plus first/last snippets; never infer runtime deadlock.
+
+    Counts are STATIC IR occurrences, not executed operations or durations.
+    Line references retain a path back to omitted loop bodies/event context.
+    """
+    counts = Counter()
+    first = {name: [] for name in ("sync", "loops", "compute", "functions")}
+    last = {name: deque(maxlen=PASTE_CONTEXT_SAMPLES) for name in first}
+    total_lines = 0
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for total_lines, line in enumerate(handle, 1):
+            # Match instructions, not #hivm.address_space/type attributes.
+            op = re.match(
+                r'^\s*(?:%[^=]*=\s*)?"?(hivm(?:\.[A-Za-z0-9_]+)+|scf\.(?:for|if|while|yield)|func\.(?:func|return))'
+                r'(?:"\s*\(|\s|\()',
+                line,
+            )
+            if not op:
+                continue
+            name = op.group(1)
+            counts[name] += 1
+            if any(token in name.lower() for token in ("sync", "set_flag", "wait_flag", "barrier")):
+                kind = "sync"
+            elif name.startswith("scf."):
+                kind = "loops"
+            elif any(token in name.lower() for token in ("mmad", "fixpipe", "nd2nz")):
+                kind = "compute"
+            elif name.startswith("func."):
+                kind = "functions"
+            else:
+                continue
+            text = line.rstrip()
+            symbol = re.search(r'sym_name\s*=\s*"([^"]+)"', text)
+            if kind == "functions" and symbol:
+                text = f"func.func sym_name={symbol.group(1)}"
+            width = MAX_IR_SNIPPET_CHARS if kind == "sync" else MAX_IR_SNIPPET_CHARS // 2
+            snippet = f"L{total_lines}: {text[:width]}" + (" [line shortened]" if len(text) > width else "")
+            if len(first[kind]) < PASTE_CONTEXT_SAMPLES:
+                first[kind].append((total_lines, snippet))
+            last[kind].append((total_lines, snippet))
+    samples = {}
+    for kind in first:
+        samples[kind] = [snippet for _, snippet in sorted(dict(first[kind] + list(last[kind])).items())]
+    return {"lines": total_lines, "static_op_counts": dict(sorted(counts.items())), "samples": samples}
+
+
+def choose_backend_ir(directory, commands):
+    # Prefer the last successful compiler invocation over a failed UB-tuning
+    # attempt. Only fall back to a debug dump if no captured HIVM output exists.
+    prefixes = [record.get("prefix") for record in reversed(commands) if record.get("returncode") == 0]
+    prefixes += [record.get("prefix") for record in reversed(commands) if record.get("returncode") != 0]
+    candidates = []
+    for prefix in prefixes:
+        if isinstance(prefix, str) and re.fullmatch(r"compiler-\d+", prefix):
+            candidates.extend(directory / f"{prefix}.{stream}.txt" for stream in ("stderr", "stdout"))
+    candidates += sorted(directory.glob("compiler-*.stderr.txt")) + sorted(directory.glob("compiler-*.stdout.txt"))
+    candidates += sorted((directory / "ir").rglob("*npuir*.mlir"))
+    for path in dict.fromkeys(candidates):
+        if path.is_file():
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                if any("hivm." in line for line in handle):
+                    return path
+    return None
+
+
+def paste_report(root, case="all", max_chars=DEFAULT_PASTE_CHARS):
+    root = root.resolve(strict=True)
+    manifest = read_optional_json(root / "manifest.json", {})
+    header = [
+        "TQBMM V2 COMPILE-ONLY SUMMARY",
+        f"directory: {root}",
+        "IR counts are static occurrences. Snippets are incomplete; they do not prove a runtime deadlock.",
+        json.dumps(
+            {key: manifest.get(key) for key in ("run_status", "python_executable", "python_prefix", "kernel_sha256")},
+            ensure_ascii=False,
+        ),
+    ]
+    names = CASES if case == "all" else (case,)
+    case_entries = {entry.get("case"): entry for entry in manifest.get("cases", []) if isinstance(entry, dict)}
+    case_budget = max(1000, (max_chars - sum(map(len, header)) - 32) // len(names))
+    sections = []
+    for name in names:
+        directory = root / name
+        report = read_optional_json(directory / "compile.json", case_entries.get(name, {}))
+        commands = read_optional_json(directory / "compiler_commands.json", [])
+        commands = commands if isinstance(commands, list) else []
+        lines = [
+            f"\n=== {name} ===",
+            json.dumps(
+                {
+                    key: report.get(key)
+                    for key in (
+                        "compile_only",
+                        "error",
+                        "shape_T_G_K_N",
+                        "grid",
+                        "options",
+                        "backend_sync_ir_found",
+                        "torch",
+                        "torch_npu",
+                        "kernel_sha256",
+                    )
+                },
+                ensure_ascii=False,
+            ),
+        ]
+        flags = []
+        for record in commands:
+            selected = [
+                arg
+                for arg in record.get("command", [])
+                if arg.startswith(
+                    (
+                        "--target=",
+                        "--enable-auto-multi-buffer=",
+                        "--enable-code-motion=",
+                        "--enable-preload=",
+                        "--enable-hivm-graph-sync-solver=",
+                        "--limit-auto-multi-buffer",
+                        "--bishengir-print-ir-after=",
+                    )
+                )
+            ]
+            flags.append({"prefix": record.get("prefix"), "returncode": record.get("returncode"), "flags": selected})
+        lines.append("compiler flags: " + json.dumps(flags))
+        path = choose_backend_ir(directory, commands)
+        if path is None:
+            lines.append("NO BACKEND HIVM IR: compilation/import may have failed; no synchronization conclusion.")
+            log = directory / "compile.log"
+            if log.is_file():
+                with log.open(encoding="utf-8", errors="replace") as handle:
+                    tail = deque(handle, maxlen=12)
+                lines.append("compile.log tail:\n" + "".join(tail))
+        else:
+            summary = summarize_ir(path)
+            lines += [
+                f"source: {path.relative_to(root)}",
+                f"source lines: {summary['lines']}",
+                "static op counts: " + json.dumps(summary["static_op_counts"]),
+            ]
+            for kind in ("functions", "sync", "loops", "compute"):
+                lines.append(f"{kind}: first/last samples (not the complete IR)")
+                lines.extend(summary["samples"][kind])
+        sections.append(limited_text("\n".join(lines), case_budget))
+    return limited_text("\n".join(header + sections), max_chars)
+
+
 def main(argv=None):
     args = parse_args(argv)
+    if args.paste:
+        print(paste_report(args.output, args.paste_case, args.paste_max_chars))
+        return
     if args.worker:
         print(json.dumps(worker(args), indent=2))
         return
@@ -230,12 +426,15 @@ def main(argv=None):
     if args.dry_run:
         print(json.dumps({"compile_only": True, "commands": commands}, indent=2))
         return
+    check_python_environment()
     args.output.mkdir(parents=True, exist_ok=False)
     kernel_path = ROOT / "vllm_ascend/ops/triton/transpose_quant_batch_matmul_v2.py"
     manifest = {
         "run_status": "running",
         "compile_only": True,
         "tqbmm_launches": 0,
+        "python_executable": sys.executable,
+        "python_prefix": sys.prefix,
         "kernel_sha256": hashlib.sha256(kernel_path.read_bytes()).hexdigest(),
         "cases": [],
     }
