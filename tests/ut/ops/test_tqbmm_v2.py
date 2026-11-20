@@ -291,6 +291,45 @@ def test_prefetch_never_carries_panel_tensors_between_loop_iterations():
     )
 
 
+@pytest.mark.parametrize("failure", [None, "input-sync", "launch", "device-sync", "cpu-copy"])
+def test_device_stage_diagnostic_reports_the_blocking_boundary(failure, capsys):
+    path = ROOT / "tests/e2e/pull_request/one_card/test_transpose_quant_batch_matmul_v2.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    function = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_run_plan_to_cpu_with_stages"
+    )
+    calls = []
+
+    def record(stage):
+        calls.append(stage)
+        if stage == failure:
+            raise RuntimeError(f"blocked at {stage}")
+
+    def sync():
+        record("device-sync" if "launch" in calls else "input-sync")
+
+    def copy():
+        record("cpu-copy")
+        return "cpu-result"
+
+    def plan():
+        record("launch")
+        return SimpleNamespace(cpu=copy)
+
+    namespace = {"torch": SimpleNamespace(npu=SimpleNamespace(synchronize=sync))}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), str(path), "exec"), namespace)
+    diagnostic = namespace[function.name]
+    if failure is not None:
+        with pytest.raises(RuntimeError, match=failure):
+            diagnostic(plan)
+        assert capsys.readouterr().out.rstrip().endswith(f"{failure}.begin")
+        assert calls[-1] == failure
+    else:
+        assert diagnostic(plan) == "cpu-result"
+        assert calls == ["input-sync", "launch", "device-sync", "cpu-copy"]
+        assert capsys.readouterr().out.rstrip().endswith("cpu-copy.done")
+
+
 @pytest.fixture
 def runner():
     spec = importlib.util.spec_from_file_location("benchmark_v2_cpu", ROOT / "benchmark_tqbmm_v2.py")

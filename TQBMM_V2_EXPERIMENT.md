@@ -71,6 +71,20 @@ python -m pytest -vv -x --tb=short \
 `--programs 0` 默认查询 `num_aicore`；若本机 Triton 没有该属性，传实际 AIC 核数，
 不要把 AIV 核数作为 AIC 核数。设备测试也覆盖了显式 programs=3 的多 tile 调度。
 
+#### 测试停在 `plan().cpu()` 时
+
+设备测试会明确在 CPU 上先计算参考结果，然后打印带 flush 的阶段标记：
+
+- `input-sync.begin` → `input-sync.done`：检查输入上传/布局转换已完成。
+- `launch.begin` → `launch.returned`：kernel 编译和提交返回，不代表设备计算已完成。
+- `device-sync.begin` → `device-sync.done`：等待设备计算完成。
+- `cpu-copy.begin` → `cpu-copy.done`：输出拷回 CPU。
+- `compare.begin` → `compare.done`：CPU 数值比较。
+
+用 `pytest -s -vv -x -o faulthandler_timeout=60` 保留标记，记录停住的完整用例名和最后一个标记。
+这些同步只用于诊断，会改变执行时序，不用于性能计时，也不应将其通过当成竞态问题已经修复。
+正式性能脚本没有增加这些诊断同步，kernel 逻辑也不因这些标记而改变。
+
 ### 2. 真实权重严格检查
 
 ```bash

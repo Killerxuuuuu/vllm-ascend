@@ -18,6 +18,28 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _run_plan_to_cpu_with_stages(plan):
+    """Diagnostic barriers only; never use this helper for performance timing.
+
+    A faulthandler stack at `plan().cpu()` cannot distinguish dispatch from
+    device completion or D2H copy. Flush markers and isolate each boundary.
+    Pre-launch synchronization also checks pending uploads independently.
+    """
+    print("[tqbmm-v2] input-sync.begin", flush=True)
+    torch.npu.synchronize()
+    print("[tqbmm-v2] input-sync.done", flush=True)
+    print("[tqbmm-v2] launch.begin", flush=True)
+    output = plan()
+    print("[tqbmm-v2] launch.returned", flush=True)
+    print("[tqbmm-v2] device-sync.begin", flush=True)
+    torch.npu.synchronize()
+    print("[tqbmm-v2] device-sync.done", flush=True)
+    print("[tqbmm-v2] cpu-copy.begin", flush=True)
+    actual = output.cpu()
+    print("[tqbmm-v2] cpu-copy.done", flush=True)
+    return actual
+
+
 @pytest.mark.parametrize("prefetch", [False, True])
 @pytest.mark.parametrize("panel_k", [64, 128, 256])
 @pytest.mark.parametrize("transposed", [False, True])
@@ -25,9 +47,19 @@ pytestmark = pytest.mark.skipif(
 def test_v2_integer_golden_and_persistent_tails(prefetch, panel_k, transposed, span):
     t, g, physical_k, n = 67, 2, 4096, 65
     torch.manual_seed(0)
-    x_cpu = torch.randint(-8, 9, (t, g, physical_k), dtype=torch.int8)
-    w_cpu = torch.randint(-8, 9, (g, n, physical_k), dtype=torch.int8)
+    x_cpu = torch.randint(-8, 9, (t, g, physical_k), dtype=torch.int8, device="cpu")
+    w_cpu = torch.randint(-8, 9, (g, n, physical_k), dtype=torch.int8, device="cpu")
     start, end = span
+    expected = (
+        torch.bmm(x_cpu[:, :, start:end].double().transpose(0, 1), w_cpu[:, :, start:end].double().transpose(1, 2))
+        .transpose(0, 1)
+        .float()
+    )
+    assert expected.device.type == "cpu"
+    print(
+        f"[tqbmm-v2] cpu-golden.done span={span} transposed={transposed} panel_k={panel_k} prefetch={prefetch}",
+        flush=True,
+    )
     x = x_cpu.npu()[:, :, start:end]
     weight = w_cpu.npu().transpose(1, 2)[:, start:end, :]
     if not transposed:
@@ -40,12 +72,10 @@ def test_v2_integer_golden_and_persistent_tails(prefetch, panel_k, transposed, s
         output_dtype=torch.float32,
         config=V2Config((32, 32, 64), panel_k, prefetch, programs=3, num_stages=2),
     )
-    expected = (
-        torch.bmm(x_cpu[:, :, start:end].double().transpose(0, 1), w_cpu[:, :, start:end].double().transpose(1, 2))
-        .transpose(0, 1)
-        .float()
-    )
-    torch.testing.assert_close(plan().cpu(), expected, rtol=0, atol=0)
+    actual = _run_plan_to_cpu_with_stages(plan)
+    print("[tqbmm-v2] compare.begin", flush=True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    print("[tqbmm-v2] compare.done", flush=True)
 
 
 @pytest.mark.parametrize("prefetch", [False, True])
