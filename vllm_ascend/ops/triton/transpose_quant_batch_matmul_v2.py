@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A3 structural experiment: persistent tiles, K panels, lookahead, one acc.
+"""A3 structural experiment: persistent tiles, paired K panels, one acc.
 
 Uses standard Triton, not A5-only UB->L1 copy APIs. Cache panels are source
 SSA values; physical L1/L0 placement and asynchronous overlap must be verified
@@ -48,7 +48,6 @@ def _v2_load_panel(
     cols,
     group,
     start_k,
-    valid,
     T: tl.constexpr,
     K: tl.constexpr,
     N: tl.constexpr,
@@ -64,9 +63,25 @@ def _v2_load_panel(
     k = start_k + tl.arange(0, PANEL_K).to(tl.int64)
     x_address = x_ptr + rows[:, None] * SXT + group * SXG + k[None, :] * SXK
     w_address = w_ptr + group * SWG + k[:, None] * SWK + cols[None, :] * SWN
-    a = tl.load(x_address, mask=valid & (rows[:, None] < T) & (k[None, :] < K), other=0)
-    b = tl.load(w_address, mask=valid & (k[:, None] < K) & (cols[None, :] < N), other=0)
+    a = tl.load(x_address, mask=(rows[:, None] < T) & (k[None, :] < K), other=0)
+    b = tl.load(w_address, mask=(k[:, None] < K) & (cols[None, :] < N), other=0)
     return a, b
+
+
+@triton.jit
+def _v2_dot_panel(
+    a_panel, b_panel, acc, BM: tl.constexpr, BN: tl.constexpr, DOT_K: tl.constexpr, PANEL_K: tl.constexpr
+):
+    # Keep the original K order and INT32 accumulation/FP32 scaling contract.
+    for micro in tl.static_range(PANEL_K // DOT_K):
+        if PANEL_K == DOT_K:
+            a, b = a_panel, b_panel
+        else:
+            indices = micro * DOT_K + tl.arange(0, DOT_K)
+            a = tl.gather(a_panel, tl.broadcast_to(indices[None, :], (BM, DOT_K)), 1)
+            b = tl.gather(b_panel, tl.broadcast_to(indices[:, None], (DOT_K, BN)), 0)
+        acc = tl.dot(a, b, acc, out_dtype=tl.int32)
+    return acc
 
 
 @triton.jit
@@ -101,68 +116,25 @@ def _transpose_quant_batch_matmul_v2_kernel(
     group = tl.program_id(1).to(tl.int64)
     num_tiles = tl.cdiv(T, BM) * tl.cdiv(N, BN)
     panel_count = tl.cdiv(K, PANEL_K)
-    if PREFETCH:
-        initial_rows, initial_cols = _v2_coordinates(pid, T, N, BM, BN)
-        a_panel, b_panel = _v2_load_panel(
-            x_ptr,
-            w_ptr,
-            initial_rows,
-            initial_cols,
-            group,
-            0,
-            True,
-            T,
-            K,
-            N,
-            SXT,
-            SXG,
-            SXK,
-            SWG,
-            SWK,
-            SWN,
-            PANEL_K,
-        )
+    panels_per_step: tl.constexpr = 2 if PREFETCH else 1
     for tile in range(pid, num_tiles, PROGRAMS):
         rows, cols = _v2_coordinates(tile, T, N, BM, BN)
         # One output accumulator per tile, reset before any dot for that tile.
         acc = tl.zeros((BM, BN), dtype=tl.int32)
-        for panel in range(panel_count):
-            if PREFETCH:
-                # Issue the next panel's loads before consuming the current
-                # panel. On a tile's final K panel, look ahead to the next tile
-                # assigned to this program, before scaling/storing current C.
-                next_tile = tl.where(panel + 1 < panel_count, tile, tile + PROGRAMS)
-                safe_tile = tl.minimum(next_tile, num_tiles - 1)
-                next_rows, next_cols = _v2_coordinates(safe_tile, T, N, BM, BN)
-                next_k = tl.where(panel + 1 < panel_count, (panel + 1) * PANEL_K, 0)
-                a_next, b_next = _v2_load_panel(
-                    x_ptr,
-                    w_ptr,
-                    next_rows,
-                    next_cols,
-                    group,
-                    next_k,
-                    next_tile < num_tiles,
-                    T,
-                    K,
-                    N,
-                    SXT,
-                    SXG,
-                    SXK,
-                    SWG,
-                    SWK,
-                    SWN,
-                    PANEL_K,
-                )
-            else:
-                a_panel, b_panel = _v2_load_panel(
+        # Panel tensors must NOT be loop-carried: A3 layout inference converts
+        # dot operands to 4D NZ, while masked lookahead can remain 2D ND. Passing
+        # one as the other's scf.for iter_arg triggers a cbuf type mismatch.
+        # Instead load/consume pairs within each iteration; only acc is carried.
+        if panel_count >= panels_per_step:
+            for step in range(panel_count // panels_per_step):
+                start_k = step * panels_per_step * PANEL_K
+                a_current, b_current = _v2_load_panel(
                     x_ptr,
                     w_ptr,
                     rows,
                     cols,
                     group,
-                    panel * PANEL_K,
-                    True,
+                    start_k,
                     T,
                     K,
                     N,
@@ -174,17 +146,52 @@ def _transpose_quant_batch_matmul_v2_kernel(
                     SWN,
                     PANEL_K,
                 )
-            # Cache/transfer granularity is independent of dot granularity.
-            for micro in tl.static_range(PANEL_K // DOT_K):
-                if PANEL_K == DOT_K:
-                    a, b = a_panel, b_panel
-                else:
-                    indices = micro * DOT_K + tl.arange(0, DOT_K)
-                    a = tl.gather(a_panel, tl.broadcast_to(indices[None, :], (BM, DOT_K)), 1)
-                    b = tl.gather(b_panel, tl.broadcast_to(indices[:, None], (DOT_K, BN)), 0)
-                acc = tl.dot(a, b, acc, out_dtype=tl.int32)
-            if PREFETCH:
-                a_panel, b_panel = a_next, b_next
+                if PREFETCH:
+                    # Lexical lookahead: load the second panel before the
+                    # first panel's dot, without crossing a loop boundary.
+                    a_next, b_next = _v2_load_panel(
+                        x_ptr,
+                        w_ptr,
+                        rows,
+                        cols,
+                        group,
+                        start_k + PANEL_K,
+                        T,
+                        K,
+                        N,
+                        SXT,
+                        SXG,
+                        SXK,
+                        SWG,
+                        SWK,
+                        SWN,
+                        PANEL_K,
+                    )
+                acc = _v2_dot_panel(a_current, b_current, acc, BM, BN, DOT_K, PANEL_K)
+                if PREFETCH:
+                    acc = _v2_dot_panel(a_next, b_next, acc, BM, BN, DOT_K, PANEL_K)
+        if PREFETCH and panel_count % 2:
+            # One panel (including K<PANEL_K) or the last odd panel: no dummy
+            # prefetch and no duplicated K accumulation.
+            a_tail, b_tail = _v2_load_panel(
+                x_ptr,
+                w_ptr,
+                rows,
+                cols,
+                group,
+                (panel_count - 1) * PANEL_K,
+                T,
+                K,
+                N,
+                SXT,
+                SXG,
+                SXK,
+                SWG,
+                SWK,
+                SWN,
+                PANEL_K,
+            )
+            acc = _v2_dot_panel(a_tail, b_tail, acc, BM, BN, DOT_K, PANEL_K)
         sx = tl.load(sx_ptr + rows * SSXT + group * SSXG, mask=rows < T, other=0)
         sw = tl.load(sw_ptr + group * SSWG + cols * SSWN, mask=cols < N, other=0)
         result = (acc.to(tl.float32) * sw[None, :]) * sx[:, None]

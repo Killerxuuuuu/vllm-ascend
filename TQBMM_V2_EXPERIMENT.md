@@ -7,7 +7,7 @@
 | 调整 | V2 实现 | 对照方式 |
 | --- | --- | --- |
 | 搬运粒度与计算粒度分离 | 加载 `PANEL_K` 宽的输入面板，拆为多个 `DOT_K` 块进行 INT8 dot | 保持 dot tile 不变，比较 panel K=64/128/256 |
-| 搬运与计算/输出交叠 | 计算当前面板前加载下一面板；当前 tile 的最后一轮提前加载下一个 tile 的首面板 | `v2` 对比 `v2_no_prefetch` |
+| 搬运与计算交叠机会 | 在同一轮内先加载相邻两个 K 面板，再依次计算；面板不跨循环传递 | `v2` 对比 `v2_no_prefetch` |
 | 限制累加器生命周期 | 每个 persistent program 顺序处理多个输出 tile，每次仅保留一份 INT32 accumulator | 记录逻辑 accumulator 字节数，检查 IR 中 CC 分配 |
 
 默认 dot tile 为 `(64,64,64)`，panel K=128，stages=2，逻辑累加器为 16 KiB。
@@ -23,6 +23,18 @@
 没有修改 V1、服务端开关、默认分块及整网调用；没有 C++ 改动，无需重新编译 C++。
 `PreparedTQBMMV2` 借用 V1 的校验和固定输入绑定，不调用 V1 kernel。
 `PreparedDynamicWoAV2` 每次读取当前激活，执行 CANN 动态量化，并分配独立输出，避免跨请求共享输出。
+
+### A3 预取编译回归修正
+
+首轮设备测试中，关闭预取通过、开启预取在 `InferHIVMDataLayout` 阶段失败：
+循环初值为四维 NZ `memref<?x?x?x?xi8, cbuf>`，循环返回值为二维 ND `memref<32x64xi8, cbuf>`。
+这是输入面板作为 `scf.for iter_arg` 跨迭代传递时的布局类型冲突，不是数值比较失败。
+
+修正后，一轮内创建、预取并消费一对面板，只有 INT32 accumulator 跨 K 循环传递。
+单面板直接计算，奇数面板单独处理尾块，保持所有 dot 的 K 顺序不变。
+不再进行跨输出 tile 的面板预取；persistent 调度、面板/计算粒度分离与单累加器仍保留。
+没有靠关闭预取、关闭安全检查、升级编译器或放宽容差来绕过测试。
+CPU 检查覆盖源码和数学逻辑，实际布局转换仍须通过 A3 编译回归确认。
 
 ## 文件
 
@@ -51,7 +63,7 @@ export V2_RUN=/home/x50063292/tqbmm-v2-$(date +%Y%m%d-%H%M%S)
 panel K=64/128/256、开/关预取及 Graph 输入变化。首次运行包含 JIT 编译耗时。
 
 ```bash
-python -m pytest -q \
+python -m pytest -vv -x --tb=short \
   tests/e2e/pull_request/one_card/test_transpose_quant_batch_matmul_v2.py
 ```
 

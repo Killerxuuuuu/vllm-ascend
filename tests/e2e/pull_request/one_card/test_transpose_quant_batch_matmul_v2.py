@@ -21,7 +21,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("prefetch", [False, True])
 @pytest.mark.parametrize("panel_k", [64, 128, 256])
 @pytest.mark.parametrize("transposed", [False, True])
-@pytest.mark.parametrize("span", [(0, 32), (32, 97), (0, 4096)])
+@pytest.mark.parametrize("span", [(0, 32), (32, 97), (0, 4096), (0, 129), (32, 289)])
 def test_v2_integer_golden_and_persistent_tails(prefetch, panel_k, transposed, span):
     t, g, physical_k, n = 67, 2, 4096, 65
     torch.manual_seed(0)

@@ -43,7 +43,7 @@ def load_kernels(language):
     nodes = []
     for node in ast.parse(SOURCE.read_text(encoding="utf-8")).body:
         if isinstance(node, ast.FunctionDef) and node.name.startswith(
-            ("_v2_coordinates", "_v2_load_panel", "_transpose_")
+            ("_v2_coordinates", "_v2_load_panel", "_v2_dot_panel", "_transpose_")
         ):
             node.decorator_list = []
             for argument in node.args.args:
@@ -54,12 +54,15 @@ def load_kernels(language):
     return namespace["_transpose_quant_batch_matmul_v2_kernel"]
 
 
-@pytest.mark.parametrize("shape", [(1, 1, 1, 1), (67, 2, 131, 65), (129, 1, 257, 35), (17, 2, 4096, 33)])
+@pytest.mark.parametrize(
+    "shape", [(1, 1, 1, 1), (67, 2, 32, 65), (67, 2, 131, 65), (129, 1, 257, 35), (17, 2, 4096, 33)]
+)
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("prefetch", [False, True])
-@pytest.mark.parametrize("panel_k", [32, 64, 128])
+@pytest.mark.parametrize("panel_ratio", [1, 2, 4])
 @pytest.mark.parametrize("programs", [1, 3])
-def test_actual_v2_source_against_int64(shape, strided, prefetch, panel_k, programs):
+@pytest.mark.parametrize("block_shape", [(16, 32, 32), (32, 32, 64)])
+def test_actual_v2_source_against_int64(shape, strided, prefetch, panel_ratio, programs, block_shape):
     t, g, k, n = shape
     rng = np.random.default_rng(5)
     x_storage = rng.integers(-128, 128, (t, g, k + 2), dtype=np.int8)
@@ -80,14 +83,54 @@ def test_actual_v2_source_against_int64(shape, strided, prefetch, panel_k, progr
         for view, storage in ((x, x_storage), (w, w_storage), (sx, sx_storage), (sw, sw_storage))
     ]
     strides = tuple(stride // view.itemsize for view in (x, w, sx, sw) for stride in view.strides)
-    programs = min(programs, Language.cdiv(t, 16) * Language.cdiv(n, 32))
+    bm, bn, dot_k = block_shape
+    panel_k = dot_k * panel_ratio
+    programs = min(programs, Language.cdiv(t, bm) * Language.cdiv(n, bn))
     for group in range(g):
         for pid in range(programs):
             kernel = load_kernels(V2Language(pid, group))
-            kernel(*pointers, Pointer(actual), t, g, k, n, *strides, 16, 32, 32, panel_k, programs, prefetch)
+            kernel(*pointers, Pointer(actual), t, g, k, n, *strides, bm, bn, dot_k, panel_k, programs, prefetch)
     golden = np.einsum("tgk,gkn->tgn", x.astype(np.int64), w.astype(np.int64))
     expected = (golden.astype(np.float32) * sw[None]) * sx[:, :, None]
     np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("inner", [32, 64, 65, 128, 129, 192, 193, 257])
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_panel_pairs_load_ahead_once_and_handle_single_odd_tails(inner, prefetch):
+    """Audit source ordering/load count, not physical DMA or pipeline overlap."""
+    x = np.ones((1, 1, inner), dtype=np.int8)
+    w = np.ones((1, inner, 1), dtype=np.int8)
+    sx = np.ones((1, 1), dtype=np.float32)
+    sw = np.ones((1, 1), dtype=np.float32)
+    actual = np.full((1, 1, 1), np.nan, dtype=np.float32)
+    events = []
+
+    class TraceLanguage(V2Language):
+        def load(self, pointer, mask, other):
+            if np.shares_memory(pointer.storage, x):
+                events.append("load_A")
+            elif np.shares_memory(pointer.storage, w):
+                events.append("load_B")
+            return super().load(pointer, mask, other)
+
+        def dot(self, a, b, acc, out_dtype):
+            events.append("dot")
+            return super().dot(a, b, acc, out_dtype)
+
+    strides = tuple(stride // value.itemsize for value in (x, w, sx, sw) for stride in value.strides)
+    load_kernels(TraceLanguage(0, 0))(
+        *map(Pointer, (x, w, sx, sw, actual)), 1, 1, inner, 1, *strides, 16, 32, 32, 64, 1, prefetch
+    )
+    panels = Language.cdiv(inner, 64)
+    if prefetch:
+        expected_events = ["load_A", "load_B", "load_A", "load_B", "dot", "dot", "dot", "dot"] * (panels // 2)
+        if panels % 2:
+            expected_events += ["load_A", "load_B", "dot", "dot"]
+    else:
+        expected_events = ["load_A", "load_B", "dot", "dot"] * panels
+    assert events == expected_events
+    assert actual[0, 0, 0] == inner
 
 
 def v2_host(host):
@@ -209,6 +252,42 @@ def test_source_has_one_accumulator_and_immutable_gm_bases():
     assert not any(
         isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "atomic_add"
         for node in ast.walk(tree)
+    )
+
+
+def test_prefetch_never_carries_panel_tensors_between_loop_iterations():
+    """Regression guard for NZ initial memref vs ND yielded memref on A3.
+
+    Each panel variable is born inside its consuming iteration/tail. There is
+    no prologue panel or `current = next` recurrence for layout inference to
+    turn into a panel-valued scf.for iter_arg. Device tests validate lowering.
+    """
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    kernel = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name.startswith("_transpose_")
+    )
+    tile_loop = next(node for node in kernel.body if isinstance(node, ast.For))
+    before_tiles = kernel.body[: kernel.body.index(tile_loop)]
+    assert not any(
+        isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_v2_load_panel"
+        for statement in before_tiles
+        for node in ast.walk(statement)
+    )
+    panel_names = {"a_current", "b_current", "a_next", "b_next", "a_tail", "b_tail"}
+    assignments = [
+        node
+        for node in ast.walk(tile_loop)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id in panel_names
+            for group in node.targets
+            for target in ast.walk(group)
+        )
+    ]
+    assert len(assignments) == 3
+    assert all(
+        isinstance(node.value, ast.Call) and getattr(node.value.func, "id", None) == "_v2_load_panel"
+        for node in assignments
     )
 
 
