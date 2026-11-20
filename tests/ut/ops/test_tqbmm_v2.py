@@ -95,9 +95,10 @@ def test_actual_v2_source_against_int64(shape, strided, prefetch, panel_ratio, p
     np.testing.assert_array_equal(actual, expected)
 
 
-@pytest.mark.parametrize("inner", [32, 64, 65, 128, 129, 192, 193, 257])
+@pytest.mark.parametrize("inner", [1, 32, 64, 65, 128, 129, 192, 193, 256, 257, 513])
 @pytest.mark.parametrize("prefetch", [False, True])
-def test_panel_pairs_load_ahead_once_and_handle_single_odd_tails(inner, prefetch):
+@pytest.mark.parametrize("panel_k,dot_k", [(64, 32), (128, 32), (64, 64), (128, 64), (256, 64)])
+def test_panel_pairs_load_ahead_once_and_handle_single_odd_tails(inner, prefetch, panel_k, dot_k):
     """Audit source ordering/load count, not physical DMA or pipeline overlap."""
     x = np.ones((1, 1, inner), dtype=np.int8)
     w = np.ones((1, inner, 1), dtype=np.int8)
@@ -120,16 +121,20 @@ def test_panel_pairs_load_ahead_once_and_handle_single_odd_tails(inner, prefetch
 
     strides = tuple(stride // value.itemsize for value in (x, w, sx, sw) for stride in value.strides)
     load_kernels(TraceLanguage(0, 0))(
-        *map(Pointer, (x, w, sx, sw, actual)), 1, 1, inner, 1, *strides, 16, 32, 32, 64, 1, prefetch
+        *map(Pointer, (x, w, sx, sw, actual)), 1, 1, inner, 1, *strides, 32, 32, dot_k, panel_k, 1, prefetch
     )
-    panels = Language.cdiv(inner, 64)
+    full_panels, tail_k = divmod(inner, panel_k)
+    panel_dots = ["dot"] * (panel_k // dot_k)
     if prefetch:
-        expected_events = ["load_A", "load_B", "load_A", "load_B", "dot", "dot", "dot", "dot"] * (panels // 2)
-        if panels % 2:
-            expected_events += ["load_A", "load_B", "dot", "dot"]
+        expected_events = (["load_A", "load_B", "load_A", "load_B"] + panel_dots * 2) * (full_panels // 2)
+        if full_panels % 2:
+            expected_events += ["load_A", "load_B"] + panel_dots
     else:
-        expected_events = ["load_A", "load_B", "dot", "dot"] * panels
+        expected_events = (["load_A", "load_B"] + panel_dots) * full_panels
+    if tail_k:
+        expected_events += ["load_A", "load_B"] + ["dot"] * Language.cdiv(tail_k, dot_k)
     assert events == expected_events
+    assert events.count("dot") == Language.cdiv(inner, dot_k)
     assert actual[0, 0, 0] == inner
 
 
@@ -273,7 +278,7 @@ def test_prefetch_never_carries_panel_tensors_between_loop_iterations():
         for statement in before_tiles
         for node in ast.walk(statement)
     )
-    panel_names = {"a_current", "b_current", "a_next", "b_next", "a_tail", "b_tail"}
+    panel_names = {"a_current", "b_current", "a_next", "b_next", "a_odd", "b_odd", "a_tail", "b_tail"}
     assignments = [
         node
         for node in ast.walk(tile_loop)
@@ -284,7 +289,7 @@ def test_prefetch_never_carries_panel_tensors_between_loop_iterations():
             for target in ast.walk(group)
         )
     ]
-    assert len(assignments) == 3
+    assert len(assignments) == 4
     assert all(
         isinstance(node.value, ast.Call) and getattr(node.value.func, "id", None) == "_v2_load_panel"
         for node in assignments

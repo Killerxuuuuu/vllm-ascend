@@ -70,10 +70,19 @@ def _v2_load_panel(
 
 @triton.jit
 def _v2_dot_panel(
-    a_panel, b_panel, acc, BM: tl.constexpr, BN: tl.constexpr, DOT_K: tl.constexpr, PANEL_K: tl.constexpr
+    a_panel,
+    b_panel,
+    acc,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    DOT_K: tl.constexpr,
+    PANEL_K: tl.constexpr,
+    ACTIVE_K: tl.constexpr,
 ):
     # Keep the original K order and INT32 accumulation/FP32 scaling contract.
-    for micro in tl.static_range(PANEL_K // DOT_K):
+    # Do not emit dot operations whose entire K subtile is padding. ACTIVE_K
+    # is compile-time: the tail is specialized, not a runtime branch on Cube.
+    for micro in tl.static_range(tl.cdiv(ACTIVE_K, DOT_K)):
         if PANEL_K == DOT_K:
             a, b = a_panel, b_panel
         else:
@@ -115,7 +124,7 @@ def _transpose_quant_batch_matmul_v2_kernel(
     pid = tl.program_id(0)
     group = tl.program_id(1).to(tl.int64)
     num_tiles = tl.cdiv(T, BM) * tl.cdiv(N, BN)
-    panel_count = tl.cdiv(K, PANEL_K)
+    full_panels = K // PANEL_K
     panels_per_step: tl.constexpr = 2 if PREFETCH else 1
     for tile in range(pid, num_tiles, PROGRAMS):
         rows, cols = _v2_coordinates(tile, T, N, BM, BN)
@@ -125,8 +134,8 @@ def _transpose_quant_batch_matmul_v2_kernel(
         # dot operands to 4D NZ, while masked lookahead can remain 2D ND. Passing
         # one as the other's scf.for iter_arg triggers a cbuf type mismatch.
         # Instead load/consume pairs within each iteration; only acc is carried.
-        if panel_count >= panels_per_step:
-            for step in range(panel_count // panels_per_step):
+        if full_panels >= panels_per_step:
+            for step in range(full_panels // panels_per_step):
                 start_k = step * panels_per_step * PANEL_K
                 a_current, b_current = _v2_load_panel(
                     x_ptr,
@@ -167,19 +176,18 @@ def _transpose_quant_batch_matmul_v2_kernel(
                         SWN,
                         PANEL_K,
                     )
-                acc = _v2_dot_panel(a_current, b_current, acc, BM, BN, DOT_K, PANEL_K)
+                acc = _v2_dot_panel(a_current, b_current, acc, BM, BN, DOT_K, PANEL_K, PANEL_K)
                 if PREFETCH:
-                    acc = _v2_dot_panel(a_next, b_next, acc, BM, BN, DOT_K, PANEL_K)
-        if PREFETCH and panel_count % 2:
-            # One panel (including K<PANEL_K) or the last odd panel: no dummy
-            # prefetch and no duplicated K accumulation.
-            a_tail, b_tail = _v2_load_panel(
+                    acc = _v2_dot_panel(a_next, b_next, acc, BM, BN, DOT_K, PANEL_K, PANEL_K)
+        if PREFETCH and full_panels % 2:
+            # The last unpaired FULL panel uses the same dot extent as pairs.
+            a_odd, b_odd = _v2_load_panel(
                 x_ptr,
                 w_ptr,
                 rows,
                 cols,
                 group,
-                (panel_count - 1) * PANEL_K,
+                (full_panels - 1) * PANEL_K,
                 T,
                 K,
                 N,
@@ -191,7 +199,30 @@ def _transpose_quant_batch_matmul_v2_kernel(
                 SWN,
                 PANEL_K,
             )
-            acc = _v2_dot_panel(a_tail, b_tail, acc, BM, BN, DOT_K, PANEL_K)
+            acc = _v2_dot_panel(a_odd, b_odd, acc, BM, BN, DOT_K, PANEL_K, PANEL_K)
+        if K % PANEL_K:
+            # A partial panel is separate for BOTH prefetch modes. Preserve the
+            # requested panel width, but only compute ceil(remaining K/DOT_K)
+            # subtiles; never pass an entirely padding K tile to dot.
+            a_tail, b_tail = _v2_load_panel(
+                x_ptr,
+                w_ptr,
+                rows,
+                cols,
+                group,
+                full_panels * PANEL_K,
+                T,
+                K,
+                N,
+                SXT,
+                SXG,
+                SXK,
+                SWG,
+                SWK,
+                SWN,
+                PANEL_K,
+            )
+            acc = _v2_dot_panel(a_tail, b_tail, acc, BM, BN, DOT_K, PANEL_K, K % PANEL_K)
         sx = tl.load(sx_ptr + rows * SSXT + group * SSXG, mask=rows < T, other=0)
         sw = tl.load(sw_ptr + group * SSWG + cols * SSWN, mask=cols < N, other=0)
         result = (acc.to(tl.float32) * sw[None, :]) * sx[:, None]
