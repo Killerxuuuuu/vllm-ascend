@@ -17,6 +17,7 @@ from tools.dsv4_a3_wo.tune_tqbmm import run_worker, write_json
 
 ROOT = Path(__file__).resolve().parent
 LAYOUT_CASES = ("composition", "native_prepacked", "v2", "v2_prepacked")
+MACRO_CASES = ("v2_macro", "v2_macro_prepacked")
 
 
 def v1_options():
@@ -57,15 +58,35 @@ def parse_args(argv=None):
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--layout-abcd", action="store_true", help="G=1 prequantized native/layout comparison, no V1")
     parser.add_argument(
+        "--macro-tile",
+        type=int,
+        nargs=2,
+        metavar=("BM", "BN"),
+        help="Add original/packed block-IO kernels to ABCD. BK and stages match the V2 control.",
+    )
+    parser.add_argument(
         "--profile-metric",
         choices=("PipeUtilization", "MemoryAccess", "L2Cache"),
         help="Profile Graph replays instead of timing; requires --layout-abcd --timing-mode graph",
     )
-    parser.add_argument("--profile-cases", nargs="+", choices=LAYOUT_CASES, help="Default: all four in the same worker")
+    parser.add_argument(
+        "--profile-cases",
+        nargs="+",
+        choices=LAYOUT_CASES + MACRO_CASES,
+        help="Default: all enabled layouts in the same worker",
+    )
     parser.add_argument("--profile-replays", type=int, default=4)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.macro_tile and (
+        not args.layout_abcd
+        or any(size not in (16, 32, 64, 128) for size in args.macro_tile)
+        or args.block_shape[2] not in (32, 64, 128)
+    ):
+        parser.error("--macro-tile requires --layout-abcd, BM/BN in 16,32,64,128 and BK in 32,64,128")
+    if not args.macro_tile and any(name in MACRO_CASES for name in args.profile_cases or ()):
+        parser.error("Macro profile cases require --macro-tile")
     if args.profile_metric and (not args.layout_abcd or args.timing_mode != "graph" or args.check_only):
         parser.error("--profile-metric requires --layout-abcd --timing-mode graph and is separate from --check-only")
     if args.profile_cases and not args.profile_metric:
@@ -134,6 +155,8 @@ def worker_command(args, tokens, seed):
         command.append("--check-only")
     if args.layout_abcd:
         command.append("--layout-abcd")
+    if args.macro_tile:
+        command.extend(["--macro-tile", *map(str, args.macro_tile)])
     if args.profile_metric:
         command.extend(["--profile-metric", args.profile_metric, "--profile-replays", str(args.profile_replays)])
         if args.profile_cases:
@@ -215,6 +238,22 @@ def check_layout_graphs(torch, functions, q):
         print(f"Changed-input graph check passed: {name}", flush=True)
 
 
+def tile_cost(t, g, k, n, bm, bn, bk):
+    """Source-level INT8 operand bytes (valid lanes); not HBM transactions or allocated UB."""
+    mt, nt, kt = (t + bm - 1) // bm, (n + bn - 1) // bn, (k + bk - 1) // bk
+    x = g * t * k * nt
+    w = g * k * n * mt
+    return {
+        "x_bytes": x,
+        "w_bytes": w,
+        "input_bytes": x + w,
+        "tiles": g * mt * nt,
+        "logical_dots": g * mt * nt * kt,
+        "acc_bytes_per_tile": bm * bn * 4,
+        "int8_operand_bytes_per_k_step": (bm + bn) * bk,
+    }
+
+
 def worker(args):
     # Worker isolation: no torch/vLLM imports in the orchestration process.
     import torch
@@ -230,6 +269,7 @@ def worker(args):
     from vllm_ascend.ops.triton.transpose_quant_batch_matmul import PreparedDynamicWoA, PreparedTQBMM
     from vllm_ascend.ops.triton.transpose_quant_batch_matmul_v2 import (
         PreparedDynamicWoAV2,
+        PreparedMacroTQBMMV2,
         PreparedTQBMMV2,
         V2Config,
     )
@@ -268,6 +308,24 @@ def worker(args):
                 "packed_weight_format": torch_npu.get_npu_format(packed),
                 "scope": "G=1 prequantized only; B/D share packed ND weight; A retains copies and stack",
             }
+            if args.macro_tile:
+                macro_shape = (*args.macro_tile, config.block_shape[2])
+                for name, operand in zip(MACRO_CASES, (weight, packed)):
+                    prequantized[name] = PreparedMacroTQBMMV2(
+                        q,
+                        operand,
+                        sx,
+                        sw,
+                        block_shape=macro_shape,
+                        num_stages=config.num_stages,
+                        output_dtype=activation.dtype,
+                    )
+                layout_metadata.update(
+                    macro_shape=macro_shape,
+                    macro_schedule="one program per output rectangle",
+                    predicted_v2=tile_cost(tokens, groups, inner, columns, *config.block_shape),
+                    predicted_macro=tile_cost(tokens, groups, inner, columns, *macro_shape),
+                )
         else:
             prequantized = {
                 "composition": lambda: qbmm_reference(q, weight, sx, sw, activation.dtype),
@@ -331,7 +389,7 @@ def worker(args):
             from profile_tqbmm import capture_layout_graph
 
             expected = prequantized["composition"]()
-            for name in dict.fromkeys(args.profile_cases or LAYOUT_CASES):
+            for name in dict.fromkeys(args.profile_cases or prequantized):
                 case_dir = args.output / f"T{tokens}-seed{args.seeds[0]}" / name
                 profiles[name] = capture_layout_graph(
                     torch, torch_npu.profiler, prequantized[name], expected, name, case_dir, args
@@ -411,6 +469,18 @@ def layout_comparisons(report):
             "A_over_C": a / c,
             "A_minus_B_ms": a - b,
             "D_minus_B_ms": d - b,
+            **(
+                {
+                    "E_macro_ms": ms["v2_macro"],
+                    "F_macro_packed_ms": ms["v2_macro_prepacked"],
+                    "A_over_E": a / ms["v2_macro"],
+                    "C_over_E": c / ms["v2_macro"],
+                    "D_over_F": d / ms["v2_macro_prepacked"],
+                    "F_over_B": ms["v2_macro_prepacked"] / b,
+                }
+                if "v2_macro" in ms
+                else {}
+            ),
         }
 
 

@@ -263,3 +263,73 @@ find "$RUN" -name focus.json -print
 `<指标>/T8192-seed0/<实现>/focus.json`；包含实际匹配的任务数、计数器原始列名、单位和有数值的行数。
 若 `counter_status=not_observed`，不要当作零。设备任务时间累加不等于图耗时，各流水计数可重叠；
 速度以未开 profiler 的 `time/layout_comparison.csv` 为准。
+
+## A3 大 T：用输入搬运量验证二维大块路径
+
+这是一条 opt-in 的单算子实验，不改服务调度、权重格式和原 V2。参考的是两类源代码，而不是照搬 A5 指令：
+
+- Ascend C：`ops-nn/matmul/quant_batch_matmul_v3/op_host/op_tiling/quant_batch_matmul_v3_basic_tiling.cpp`
+  的 `CheckLoadAndCalcSize` 同时考虑 L1 加载量和计算轮数；
+  同算子的 `op_kernel/quant_batch_matmul_v3_pertoken_opt.h` 在一组 N 块的循环外设置 A。
+  这是组织复用的例子，不据此推断本次原生 kernel 具体选了哪个模板。
+- Triton-Ascend：`third_party/ascend/tutorials/03-matrix-multiplication.py` 用一个输出块沿 K 累加、再按行切片做输出处理；
+  同目录的 `06-fused-attention.py` 展示二维 block pointer 和按物理布局读取后转置再 dot。
+  借用的是访存与计算的组织方式；参考示例不是本算子的 INT8 正确性验证。
+
+对单个 group，不做 split-K、每个 program 独占一个 BM×BN 输出块时，每次乘法的源码级有效输入字节数为
+`T*K*ceil(N/BN) + K*N*ceil(T/BM)`（INT8）。第一项是每组输出列块都要读 X，第二项是每组输出行块都要读 W。
+同一 K 元素参与哪些乘加不变，扩大的是一次加载服务的输出范围。K 循环结束后才转 FP32，先乘 Sw，再乘 Sx。
+
+在 T/G/K/N = 8192/1/4096/1024、BK=64 时：
+
+| BM×BN | X + W（有效字节） | 输出块数 | 源码 dot 次数 | 每块逻辑 INT32 累加器 |
+| --- | ---: | ---: | ---: | ---: |
+| 64×64 | 512 + 512 MiB | 2048 | 131072 | 16 KiB |
+| 128×128 | 256 + 256 MiB | 512 | 32768 | 64 KiB |
+
+旧 V2 D 的 AIC GM→L1 实测为 1024 MiB/调用，与第一行吻合；原生 B 约为 384 MiB/调用。
+新路径预测的是有效读取量，不是 HBM 字节数或时延上限。硬件可拆分一次 dot，编译器也可能重复搬运；
+更大的累加器或更少的并行任务都可能抵消收益。分行处理缩放是为了减少同时处理的 FP32 元素数，不保证不产生临时 workspace。
+
+沿用 A/B/C/D，新增 E（新 kernel，真实转置权重视图）与 F（新 kernel，与 B/D 共用连续权重）。
+以下命令在 A3 容器同一个 Bash 终端运行；不要拉起 vLLM 服务。不要在计时轮开 profiler 或 memscope。
+
+```bash
+cd /home/x50063292/vllm-ascend
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export QUANT_MODEL=/mnt/share/outputs/dsv4-0731-w8a8-int8-with-wo-20261103-024433
+RUN=$(mktemp -d /home/x50063292/tqbmm-macro.XXXXXX)
+COMMON=(--layout-abcd --quant-model "$QUANT_MODEL" --device npu:0 --layer 0 --tp-size 8 --tp-rank 0
+        --tokens 8192 --timing-mode graph --graph-batch-size 4 --panel-k 64 --num-stages 2)
+python -m pytest -q tests/e2e/pull_request/one_card/test_transpose_quant_batch_matmul_v2.py -k macro
+```
+
+通过后，第一轮比较旧 64 与新 128；第二轮保持旧、新都是 64（与第一轮 E/F 相比只改变新 kernel 的 BM/BN）。
+这样不依赖旧 kernel 也能编译 128×128。两轮都要求逐元素严格一致、CPU 整数点积抽查和改变输入后的 graph replay 通过。
+
+```bash
+for SZ in 128 64; do
+  python -u benchmark_tqbmm_v2.py "${COMMON[@]}" --block-shape 64 64 64 --macro-tile "$SZ" "$SZ" \
+    --seeds 0 1 --iterations 60 --repeats 5 --output "$RUN/new-$SZ" || break
+  cat "$RUN/new-$SZ/layout_comparison.csv"
+done
+```
+
+最后单独采计数器，对照 B/D/F；三个 case 共用同一进程的数据与相同的逻辑调用数。
+
+```bash
+for METRIC in MemoryAccess PipeUtilization; do
+  python -u benchmark_tqbmm_v2.py "${COMMON[@]}" --block-shape 64 64 64 --macro-tile 128 128 \
+    --seeds 0 --profile-metric "$METRIC" --profile-cases native_prepacked v2_prepacked v2_macro_prepacked \
+    --profile-replays 4 --timeout 1800 --output "$RUN/$METRIC" || break
+done
+find "$RUN" -name focus.json -print
+```
+
+- 先看 `new-128/layout_comparison.csv` 的 `A_over_E`，大于 1 才是在真实权重布局下超过拼接（仅 prequantized graph）。
+  `F_over_B` 是排除在线权重复制后的耗时比，越接近 1 越好。
+- `new-64` 的 `D_over_F` 是相同块大小的新旧结构比较；两轮的 F 耗时之比对应改变新 kernel 块大小的效果。
+- 若 F 的 `aic_GM_to_L1_datas(KB)` 接近 524288 而延迟不降，转看 MTE2/MAC **绝对时间**、布局转换与临时 GM 写回；
+  若仍接近 1048576，先查生成的 IR 是否重复读取 A/B，不再上调 stages。流水计数器不能相加。
+- 若 128×128 首次编译报片上存储不足，保留报错，改测 `--macro-tile 64 128`（预测 768 MiB）；
+  不放宽数值容差，不把失败配置计入性能表。

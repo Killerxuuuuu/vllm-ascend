@@ -108,6 +108,66 @@ def load_kernels(language):
     return load_kernel_namespace(language)["_transpose_quant_batch_matmul_v2_kernel"]
 
 
+@pytest.mark.parametrize("shape", [(128, 1, 128, 128), (131, 2, 129, 71), (7, 1, 4096, 35)])
+@pytest.mark.parametrize("packed", [False, True])
+def test_macro_addresses_traffic_and_integer_golden(shape, packed):
+    t, g, k, n = shape
+    bm, bn, bk = 128, 128, 64
+    rng = np.random.default_rng(17)
+    x_buf = rng.integers(-128, 128, (t, g, k + 2), dtype=np.int8)
+    x = x_buf[:, :, 1:-1]
+    w_buf = rng.integers(-128, 128, (g, n, k + 2), dtype=np.int8)
+    w = w_buf[:, :, 1:-1].transpose(0, 2, 1)
+    if packed:
+        w_buf = w = w.copy(order="C")
+    sx = rng.random((t, g), dtype=np.float32)
+    sw = rng.random((g, n), dtype=np.float32)
+    y = np.full((t, g, n), np.nan, dtype=np.float32)
+    reads = {"x": 0, "w": 0}
+    writes = np.zeros(y.size, dtype=np.int32)
+
+    class BlockLanguage(V2Language):
+        @staticmethod
+        def make_block_ptr(base, shape, strides, offsets, block_shape, order):
+            assert order == (1, 0) and strides[1] == 1
+            return SimpleNamespace(base=base, shape=shape, strides=strides, offsets=offsets, block=block_shape)
+
+        @staticmethod
+        def advance(pointer, offsets):
+            return SimpleNamespace(
+                **(vars(pointer) | {"offsets": tuple(a + b for a, b in zip(pointer.offsets, offsets))})
+            )
+
+        def load(self, pointer, mask=None, other=None, *, boundary_check=(), padding_option=None):
+            if isinstance(pointer, Pointer):
+                return super().load(pointer, mask, other)
+            i, j = [offset + np.arange(size) for offset, size in zip(pointer.offsets, pointer.block)]
+            valid = (i[:, None] < pointer.shape[0]) & (j[None, :] < pointer.shape[1])
+            assert valid.all() or (boundary_check == (0, 1) and padding_option == "zero")
+            reads["x" if np.shares_memory(pointer.base.storage, x_buf) else "w"] += valid.sum()
+            addresses = pointer.base + i[:, None] * pointer.strides[0] + j[None, :] * pointer.strides[1]
+            return super().load(addresses, valid, 0)
+
+        def store(self, pointer, value, mask):
+            np.add.at(writes, pointer.offset[mask], 1)
+            super().store(pointer, value, mask)
+
+    pointers = [
+        Pointer(storage, (view.ctypes.data - storage.ctypes.data) // view.itemsize)
+        for view, storage in ((x, x_buf), (w, w_buf), (sx, sx), (sw, sw), (y, y))
+    ]
+    strides = tuple(s // v.itemsize for v in (x, w, sx, sw) for s in v.strides)
+    mt, nt = Language.cdiv(t, bm), Language.cdiv(n, bn)
+    for group in range(g):
+        for pid in range(mt * nt):
+            kernel = load_kernel_namespace(BlockLanguage(pid, group))["_transpose_quant_batch_matmul_v2_kernel_macro"]
+            kernel(*pointers, t, g, k, n, *strides, bm, bn, bk)
+    golden = np.einsum("tgk,gkn->tgn", x.astype(np.int64), w.astype(np.int64))
+    np.testing.assert_array_equal(y, (golden.astype(np.float32) * sw[None]) * sx[:, :, None])
+    np.testing.assert_array_equal(writes, 1)
+    assert reads == {"x": x.size * nt, "w": w.size * mt}
+
+
 @pytest.mark.parametrize("block_shape", [(16, 32, 32), (32, 32, 64), (64, 16, 128), (128, 64, 128)])
 @pytest.mark.parametrize("panel_ratio", [1, 2, 4])
 @pytest.mark.parametrize("transposed", [False, True])
@@ -320,7 +380,9 @@ def test_panel_pairs_load_ahead_once_and_handle_single_odd_tails(inner, prefetch
 def v2_host(host):
     module, backend = host
     namespace = module.__dict__
-    namespace.update(_transpose_quant_batch_matmul_v2_kernel=backend)
+    namespace.update(
+        _transpose_quant_batch_matmul_v2_kernel=backend, _transpose_quant_batch_matmul_v2_kernel_macro=backend
+    )
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     nodes = [
         node
@@ -333,6 +395,28 @@ def v2_host(host):
     ]
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(SOURCE), "exec"), namespace)
     return module, backend
+
+
+def test_macro_fixed_plan_grid_and_layout_guards(host):
+    module, backend = v2_host(host)
+    x, w, sx, sw = host_stubs.inputs(backend, tokens=129)
+    options = {"block_shape": (128, 128, 64), "num_stages": 2}
+    plan = module.PreparedMacroTQBMMV2(x, w, sx, sw, **options)
+    assert plan() is plan.output
+    assert backend.launches[-1][0] == (2, 2)
+    assert backend.launches[-1][2] == dict(BM=128, BN=128, BK=64, num_stages=2)
+    for x_stride, w_stride in [((260, 130, 2), w.stride()), (x.stride(), (5000, 2, 130))]:
+        with pytest.raises(ValueError, match="Macro block IO"):
+            module.PreparedMacroTQBMMV2(
+                backend.tensor(x.shape, "i8", strides=x_stride),
+                backend.tensor(w.shape, "i8", strides=w_stride),
+                sx,
+                sw,
+                **options,
+            )
+    empty = host_stubs.inputs(backend, tokens=0)
+    assert module.PreparedMacroTQBMMV2(*empty, **options)().shape == (0, 2, 33)
+    assert len(backend.launches) == 1
 
 
 def test_fixed_and_dynamic_v2_contracts(host):

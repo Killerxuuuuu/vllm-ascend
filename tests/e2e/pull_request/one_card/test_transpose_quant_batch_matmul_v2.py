@@ -9,6 +9,7 @@ from benchmark_tqbmm_v2 import check_layout_graphs, layout_cases
 from tools.dsv4_a3_wo.benchmark_tqbmm import dynamic_qbmm_reference, qbmm_reference
 from vllm_ascend.ops.triton.transpose_quant_batch_matmul_v2 import (
     PreparedDynamicWoAV2,
+    PreparedMacroTQBMMV2,
     PreparedTQBMMV2,
     V2Config,
 )
@@ -36,6 +37,27 @@ def test_v2_native_layout_abcd_graph():
     for function in cases.values():
         torch.testing.assert_close(function().cpu(), expected, atol=0, rtol=0)
     check_layout_graphs(torch, cases, q)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("shape", [(128, 1, 4096, 128), (131, 2, 129, 133)])
+def test_macro_exact_bf16_with_offsets_and_tails(shape, packed):
+    t, g, k, n = shape
+    gen = torch.Generator().manual_seed(19)
+    x = torch.randint(-128, 128, (t, g, k + 2), dtype=torch.int8, generator=gen)
+    w = torch.randint(-128, 128, (g, n, k + 2), dtype=torch.int8, generator=gen)
+    sx = torch.rand((t, g), generator=gen)
+    sw = torch.rand((g, n), generator=gen)
+    # Float64 represents these integer dot products exactly; scale order matches the kernel.
+    acc = torch.bmm(x[:, :, 1:-1].transpose(0, 1).double(), w[:, :, 1:-1].transpose(1, 2).double())
+    golden = ((acc.transpose(0, 1).float() * sw[None]) * sx[:, :, None]).bfloat16()
+    weight = w.npu()[:, :, 1:-1].transpose(1, 2)
+    if packed:
+        weight = weight.contiguous()
+    plan = PreparedMacroTQBMMV2(
+        x.npu()[:, :, 1:-1], weight, sx.npu(), sw.npu(), block_shape=(128, 128, 64), num_stages=2
+    )
+    torch.testing.assert_close(plan().cpu(), golden, rtol=0, atol=0)
 
 
 def _run_plan_to_cpu_with_stages(plan):

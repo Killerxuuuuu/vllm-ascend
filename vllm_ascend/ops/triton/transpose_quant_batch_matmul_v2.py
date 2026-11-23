@@ -316,6 +316,104 @@ def _launch_v2(arguments, config, cores):
     )
 
 
+@triton.jit
+def _transpose_quant_batch_matmul_v2_kernel_macro(
+    x_ptr,
+    w_ptr,
+    sx_ptr,
+    sw_ptr,
+    y_ptr,
+    T: tl.constexpr,
+    G: tl.constexpr,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    SXT: tl.constexpr,
+    SXG: tl.constexpr,
+    SXK: tl.constexpr,
+    SWG: tl.constexpr,
+    SWK: tl.constexpr,
+    SWN: tl.constexpr,
+    SSXT: tl.constexpr,
+    SSXG: tl.constexpr,
+    SSWG: tl.constexpr,
+    SSWN: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    # One program owns one output rectangle. Subblocks of this wider dot
+    # consume common A rows/B columns, rather than reloading them per small tile.
+    pid = tl.program_id(0)
+    group = tl.program_id(1).to(tl.int64)
+    ntiles: tl.constexpr = (N + BN - 1) // BN
+    m0 = (pid // ntiles) * BM
+    n0 = (pid % ntiles) * BN
+    a0 = tl.make_block_ptr(x_ptr + group * SXG, (T, K), (SXT, SXK), (m0, 0), (BM, BK), (1, 0))
+    if SWN == 1:
+        b0 = tl.make_block_ptr(w_ptr + group * SWG, (K, N), (SWK, SWN), (0, n0), (BK, BN), (1, 0))
+    else:
+        # Physical [N,K] view: the contiguous dimension is last on both input DMAs.
+        b0 = tl.make_block_ptr(w_ptr + group * SWG, (N, K), (SWN, SWK), (n0, 0), (BN, BK), (1, 0))
+    acc = tl.zeros((BM, BN), dtype=tl.int32)
+    for step in range((K + BK - 1) // BK):
+        k0 = step * BK
+        # Absolute advances; do not carry a block pointer or an NZ panel through the loop.
+        ap = tl.advance(a0, (0, k0))
+        if (T % BM == 0) & (K % BK == 0):
+            a = tl.load(ap)
+        else:
+            a = tl.load(ap, boundary_check=(0, 1), padding_option="zero")
+        if SWN == 1:
+            bp = tl.advance(b0, (k0, 0))
+        else:
+            bp = tl.advance(b0, (0, k0))
+        if (N % BN == 0) & (K % BK == 0):
+            b = tl.load(bp)
+        else:
+            b = tl.load(bp, boundary_check=(0, 1), padding_option="zero")
+        if SWN != 1:
+            b = tl.trans(b)
+        acc = tl.dot(a, b, acc, out_dtype=tl.int32)
+
+    cols = n0.to(tl.int64) + tl.arange(0, BN)
+    sw = tl.load(sw_ptr + group * SSWG + cols * SSWN, mask=cols < N, other=0)
+    # Like the Ascend Triton matmul tutorial, convert/write row slices rather
+    # than materializing a second full macro tile of FP32 epilogue values.
+    half_m: tl.constexpr = BM // 2
+    for part in tl.static_range(2):
+        rows = m0.to(tl.int64) + part * half_m + tl.arange(0, half_m)
+        sx = tl.load(sx_ptr + rows * SSXT + group * SSXG, mask=rows < T, other=0)
+        sub = extract_slice(acc, (part * half_m, 0), (half_m, BN), (1, 1))
+        result = (sub.to(tl.float32) * sw[None, :]) * sx[:, None]
+        address = y_ptr + (rows[:, None] * G + group) * N + cols[None, :]
+        tl.store(address, result.to(y_ptr.dtype.element_ty), mask=(rows[:, None] < T) & (cols[None, :] < N))
+
+
+class PreparedMacroTQBMMV2(PreparedTQBMM):
+    """Opt-in A3 experiment: regular 2D block IO, one wide accumulator, independent output tiles."""
+
+    def __init__(self, x, weight, sx, sw, *, block_shape, num_stages, output_dtype=torch.bfloat16, out=None):
+        if len(block_shape) != 3:
+            raise ValueError("Macro kernel requires (BM,BN,BK)")
+        validate_v2_options(block_shape, block_shape[2], False, 0)
+        super().__init__(
+            x, weight, sx, sw, block_shape=block_shape, num_stages=num_stages, output_dtype=output_dtype, out=out
+        )
+        if x.stride()[-1] != 1 or min(weight.stride()[1:]) != 1:
+            raise ValueError("Macro block IO requires X contiguous along K and W contiguous along K or N")
+        # make_block_ptr offsets are signed i32; the backing addresses and strides are not.
+        if max(x.shape[0], x.shape[2], weight.shape[2], self._grid[0]) > (1 << 31) - max(block_shape):
+            raise ValueError("Macro tile indices exceed the signed 32-bit block pointer offset range")
+
+    def __call__(self):
+        if not self._empty:
+            bm, bn, bk = self._block_shape
+            _transpose_quant_batch_matmul_v2_kernel_macro[self._grid](
+                *self._arguments, BM=bm, BN=bn, BK=bk, num_stages=self._num_stages
+            )
+        return self.output
+
+
 @dataclass(frozen=True, init=False, eq=False)
 class PreparedTQBMMV2:
     _binding: PreparedTQBMM

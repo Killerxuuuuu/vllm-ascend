@@ -67,6 +67,31 @@ def test_ratio_denominators_are_native_centered():
     assert packed["time_over_native_prepacked"] == 4 and "speedup_vs_v1" not in packed
 
 
+def test_macro_is_opt_in_and_forwarded_to_worker():
+    base = ["--quant-model", ".", "--output", "unused", "--timing-mode", "graph"]
+    macro = ["--macro-tile", "128", "128"]
+    profile = ["--profile-metric", "MemoryAccess", "--profile-cases", "v2_macro_prepacked"]
+    for invalid in (macro, ["--layout-abcd", *profile], ["--layout-abcd", "--macro-tile", "256", "64"]):
+        with pytest.raises(SystemExit):
+            runner.parse_args([*base, *invalid])
+    args = runner.parse_args([*base, "--layout-abcd", *macro, *profile])
+    worker = runner.parse_args(runner.worker_command(args, 8192, 0)[3:])
+    assert worker.macro_tile == [128, 128] and worker.profile_cases == ["v2_macro_prepacked"]
+    ms = dict(zip(runner.LAYOUT_CASES + runner.MACRO_CASES, [2, 1, 8, 4, 2, 1]))
+    report = {"T": 8192, "seed": 0, "layout_abcd": {}, "timings": {"graph": {"prequantized": {"median_ms": ms}}}}
+    (row,) = runner.layout_comparisons(report)
+    assert (row["A_over_E"], row["C_over_E"], row["D_over_F"], row["F_over_B"]) == (1, 4, 4, 1)
+
+
+def test_macro_operand_byte_prediction():
+    shape = (8192, 1, 4096, 1024)
+    small = runner.tile_cost(*shape, 64, 64, 64)
+    wide = runner.tile_cost(*shape, 128, 128, 64)
+    assert small["input_bytes"] == 1024 * 2**20
+    assert wide["x_bytes"] == wide["w_bytes"] == 256 * 2**20
+    assert wide["logical_dots"] == 32768 and wide["acc_bytes_per_tile"] == 64 * 1024
+
+
 def test_focus_prefers_observed_pmu_only_counts_one_export(tmp_path):
     kernel = "_transpose_quant_batch_matmul_v2_kernel"
     (tmp_path / "kernel_details.csv").write_text(f"Name,Duration(us),aic_icache_miss_rate\n{kernel},12,0.1\n")
