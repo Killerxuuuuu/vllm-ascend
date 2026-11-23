@@ -49,6 +49,20 @@ def test_static_range_rejects_tensor_cdiv_result():
     assert list(language.static_range((32 + 64 - 1) // 64)) == [0]
 
 
+def test_v2_jit_has_no_chained_boolean_operators():
+    """Python accepts three-way BoolOps; the A3 Triton AST-to-TTIR frontend rejects them."""
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    violations = [
+        (function.name, node.lineno, ast.unparse(node))
+        for function in tree.body
+        if isinstance(function, ast.FunctionDef)
+        and any(ast.unparse(d) == "triton.jit" for d in function.decorator_list)
+        for node in ast.walk(function)
+        if isinstance(node, ast.BoolOp) and len(node.values) > 2
+    ]
+    assert not violations, violations
+
+
 def test_shape_control_and_micro_loop_bound_are_explicit_constexpr():
     """NumPy cannot model Triton's unannotated-Assign conversion to tensors.
 

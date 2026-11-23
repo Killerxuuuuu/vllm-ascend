@@ -189,7 +189,9 @@ def _transpose_quant_batch_matmul_v2_kernel(
     num_tiles: tl.constexpr = ((T + BM - 1) // BM) * ((N + BN - 1) // BN)
     # Shape specialization, not a runtime branch per tile. With ragged M/N
     # even a full K panel contains masked rows/columns in the persistent loop.
-    wide: tl.constexpr = T % BM == 0 and N % BN == 0 and K % PANEL_K == 0
+    # Combine constexpr booleans with binary operators: the A3 frontend
+    # rejects a single Python BoolOp with three operands before TTIR exists.
+    wide: tl.constexpr = (T % BM == 0) & (N % BN == 0) & (K % PANEL_K == 0)
     step_k: tl.constexpr = 2 * PANEL_K if PREFETCH else PANEL_K
     full_steps: tl.constexpr = K // step_k
     tail_k: tl.constexpr = K % step_k
