@@ -215,3 +215,51 @@ python -u benchmark_tqbmm_v2.py \
 
 各硬件流水时间允许重叠，不能相加当作总耗时；MTE2 ratio 也不是 HBM 带宽利用率。
 profiling 与性能计时分开运行。
+
+## 大 T：以原生拼接为基线，分离权重布局和矩阵乘差距
+
+在 A3 容器内使用能导入 `torch_npu` 和当前分支的 Python。只需要一张空闲卡和量化权重，不启动 vLLM。
+下面是 prequantized 实验：四组使用同一个 worker 的 INT8 输入、两组 scale、BF16 输出和同一个逻辑权重。
+
+| 标记 | CSV 实现名 | Graph 里做什么 |
+| --- | --- | --- |
+| A | composition | 真实拼接：原始转置视图 → 逐组 contiguous → 原生 QBMM → stack |
+| B | native_prepacked | 原生 QBMM；事先准备二维输入和连续权重，输出仅增加一个长度为 1 的维度 |
+| C | v2 | Prepared V2，读取与 A 相同的转置视图 |
+| D | v2_prepacked | 同一个 V2 配置，但读取 B 的同一块连续 ND 权重 |
+
+B/D 的 pack 仅做一次，不计入时间；这里的 prepacked 指 PyTorch 可见的连续 ND，不是原生库私有格式。
+本实验要求每个 rank 的 G=1；B 的输出是 view，不代表 G>1 的部署方式。A/B 的差额包括整个包装路径，
+不是单个 transpose 的耗时。B 的输出由原生 API 管理，C/D 使用已有输出；D/B 不是单条 Cube 指令的速度比。
+
+```bash
+cd /home/x50063292/vllm-ascend
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export QUANT_MODEL=/mnt/share/outputs/dsv4-0731-w8a8-int8-with-wo-20261103-024433
+RUN=$(mktemp -d /home/x50063292/tqbmm-abcd.XXXXXX)
+COMMON=(--layout-abcd --quant-model "$QUANT_MODEL" --device npu:0
+        --layer 0 --tp-size 8 --tp-rank 0 --tokens 8192
+        --block-shape 64 64 64 --panel-k 64 --num-stages 2 --programs 0
+        --timing-mode graph --graph-batch-size 4 --warmup 10)
+python -u benchmark_tqbmm_v2.py "${COMMON[@]}" --seeds 0 1 --iterations 60 --repeats 5 --output "$RUN/time"
+cat "$RUN/time/layout_comparison.csv"
+```
+
+测速自动做逐元素严格比较、独立 CPU 整数点积抽查、替换输入内容后的 Graph 回放检查。失败不进入计时。
+`A_over_C > 1` 才表示原布局的融合实现快于真实拼接；`C_over_D > 1` 表示预排加快了 V2；
+若 `D_over_B` 仍远大于 1，说明外部输入布局相同后差距仍在，接下来比较 B、D 内部的数据流。
+
+```bash
+for METRIC in PipeUtilization MemoryAccess L2Cache; do
+  python -u benchmark_tqbmm_v2.py "${COMMON[@]}" --seeds 0 --profile-metric "$METRIC" \
+    --profile-cases native_prepacked v2_prepacked --profile-replays 4 --timeout 1800 \
+    --output "$RUN/$METRIC" || break
+done
+find "$RUN" -name focus.json -print
+```
+
+同一指标独立采集；每个 case 采 4 次回放 × 每图 4 次调用。要检查 A 的复制/stack 或直接对比 C/D，
+从命令中去掉 `--profile-cases native_prepacked v2_prepacked` 即采四组。小报告为
+`<指标>/T8192-seed0/<实现>/focus.json`；包含实际匹配的任务数、计数器原始列名、单位和有数值的行数。
+若 `counter_status=not_observed`，不要当作零。设备任务时间累加不等于图耗时，各流水计数可重叠；
+速度以未开 profiler 的 `time/layout_comparison.csv` 为准。

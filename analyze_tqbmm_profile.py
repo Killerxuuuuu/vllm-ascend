@@ -69,7 +69,12 @@ def family(name, kind):
     text = re.sub(r"[^a-z0-9]", "", (name + " " + kind).lower())
     if "transposequantbatchmatmul" in text:
         # Only the known Triton entry point is unambiguous.
-        return "triton_tqbmm" if "_transpose_quant_batch_matmul_kernel" in name else "native_quant_matmul_candidate"
+        triton_entries = ("_transpose_quant_batch_matmul_kernel", "_transpose_quant_batch_matmul_v2_kernel")
+        return (
+            "triton_tqbmm"
+            if any(entry in name.lower() for entry in triton_entries)
+            else "native_quant_matmul_candidate"
+        )
     if any(word in text for word in ("hccl", "allreduce", "allgather", "reducescatter", "alltoall", "sendrecv")):
         return "communication"
     if any(word in text for word in ("quantbatchmatmul", "quantmatmul", "qbmm")):
@@ -120,7 +125,8 @@ class Stats:
 
 
 class Aggregator:
-    def __init__(self):
+    def __init__(self, extra_counters=()):
+        self.extra_counters = extra_counters
         self.names = {}
         self.shapes = {}
         self.families = {}
@@ -162,10 +168,10 @@ class Aggregator:
             self.missing_shapes += count
         counters = {}
         if not summary:
-            for key in (*COUNTER_FIELDS, *PIPELINE_TIME_FIELDS):
+            for key in (*COUNTER_FIELDS, *PIPELINE_TIME_FIELDS, *self.extra_counters):
                 try:
                     value = number(row.get(key, ""))
-                    if key in PIPELINE_TIME_FIELDS or value <= 1:
+                    if key not in COUNTER_FIELDS or value <= 1:
                         counters[key] = value
                 except (ValueError, TypeError):
                     pass
@@ -190,7 +196,7 @@ def select_source(path):
     return candidates[0], len(candidates)
 
 
-def read_source(source):
+def read_source(source, extra_counter_filter=None):
     before = source.stat()
     aggregate = Aggregator()
     upstream = {}
@@ -215,6 +221,12 @@ def read_source(source):
         with source.open(encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
             reader.fieldnames = [name.strip() for name in (reader.fieldnames or [])]
+            if extra_counter_filter is not None:
+                aggregate.extra_counters = tuple(
+                    key
+                    for key in reader.fieldnames
+                    if key not in (*PIPELINE_TIME_FIELDS, *COUNTER_FIELDS) and extra_counter_filter(key)
+                )
             if not {"Duration(us)", "Task Duration(us)"}.intersection(reader.fieldnames):
                 raise ValueError("CSV lacks Duration(us) / Task Duration(us)")
             for row in reader:

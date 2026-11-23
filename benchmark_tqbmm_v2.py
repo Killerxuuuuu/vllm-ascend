@@ -16,6 +16,7 @@ from tools.dsv4_a3_wo.runtime_options import internal_format_enabled
 from tools.dsv4_a3_wo.tune_tqbmm import run_worker, write_json
 
 ROOT = Path(__file__).resolve().parent
+LAYOUT_CASES = ("composition", "native_prepacked", "v2", "v2_prepacked")
 
 
 def v1_options():
@@ -54,9 +55,23 @@ def parse_args(argv=None):
     parser.add_argument("--timing-mode", choices=["eager", "graph", "both"], default="both")
     parser.add_argument("--timeout", type=int, default=900, help="Timeout per fresh T/seed process, seconds")
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--layout-abcd", action="store_true", help="G=1 prequantized native/layout comparison, no V1")
+    parser.add_argument(
+        "--profile-metric",
+        choices=("PipeUtilization", "MemoryAccess", "L2Cache"),
+        help="Profile Graph replays instead of timing; requires --layout-abcd --timing-mode graph",
+    )
+    parser.add_argument("--profile-cases", nargs="+", choices=LAYOUT_CASES, help="Default: all four in the same worker")
+    parser.add_argument("--profile-replays", type=int, default=4)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.profile_metric and (not args.layout_abcd or args.timing_mode != "graph" or args.check_only):
+        parser.error("--profile-metric requires --layout-abcd --timing-mode graph and is separate from --check-only")
+    if args.profile_cases and not args.profile_metric:
+        parser.error("--profile-cases requires --profile-metric")
+    if args.profile_replays < 1:
+        parser.error("--profile-replays must be positive")
     if any(value <= 0 for value in (*args.tokens, args.iterations, args.repeats, args.graph_batch_size, args.timeout)):
         parser.error("tokens/iterations/repeats/graph-batch-size/timeout must be positive")
     if (
@@ -117,6 +132,12 @@ def worker_command(args, tokens, seed):
     ]
     if args.check_only:
         command.append("--check-only")
+    if args.layout_abcd:
+        command.append("--layout-abcd")
+    if args.profile_metric:
+        command.extend(["--profile-metric", args.profile_metric, "--profile-replays", str(args.profile_replays)])
+        if args.profile_cases:
+            command.extend(["--profile-cases", *dict.fromkeys(args.profile_cases)])
     return command
 
 
@@ -143,11 +164,55 @@ def measure(functions, args, timer):
 def source_hashes():
     names = (
         "benchmark_tqbmm_v2.py",
+        "profile_tqbmm.py",
+        "analyze_tqbmm_profile.py",
         "vllm_ascend/ops/triton/transpose_quant_batch_matmul_v2.py",
         "vllm_ascend/ops/triton/transpose_quant_batch_matmul.py",
         "tools/dsv4_a3_wo/benchmark_tqbmm.py",
     )
     return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in names}
+
+
+def layout_cases(q, weight, sx, sw, dtype, config, reference, native, prepare):
+    """Pack once. B's 2-D weight is a view of D's 3-D allocation, not another copy."""
+    if weight.shape[0] != 1 or weight.is_contiguous() or weight.stride(1) != 1:
+        raise ValueError("ABCD requires G=1 and the original noncontiguous transposed [G,K,N] weight")
+    packed = weight.contiguous()
+    q2, w2, sx1, sw1 = q[:, 0], packed[0], sx[:, 0], sw[0]
+    if not all(tensor.is_contiguous() for tensor in (q2, w2, sx1, sw1)):
+        raise ValueError("Native B requires contiguous input/scale views; no hidden packing")
+    return {
+        "composition": lambda: reference(q, weight, sx, sw, dtype),
+        "native_prepacked": lambda: native(q2, w2, sw1, pertoken_scale=sx1, output_dtype=dtype).unsqueeze(1),
+        "v2": prepare(q, weight, sx, sw, config=config, output_dtype=dtype),
+        "v2_prepacked": prepare(q, packed, sx, sw, config=config, output_dtype=dtype),
+    }, packed
+
+
+def check_layout_graphs(torch, functions, q):
+    """Both the zeroed input and the restored input must be visible on replay."""
+    original = q.clone()
+    golden = functions["composition"]()
+    if not golden.any().item():
+        raise ValueError("Changed-input gate needs a nonzero reference")
+    for name, function in functions.items():
+        function()
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            captured = function()
+        q.zero_()
+        try:
+            graph.replay()
+            torch.npu.synchronize()
+            torch.testing.assert_close(captured, torch.zeros_like(golden), atol=0, rtol=0)
+        finally:
+            q.copy_(original)
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(captured, golden, atol=0, rtol=0)
+        del captured, graph
+        print(f"Changed-input graph check passed: {name}", flush=True)
 
 
 def worker(args):
@@ -192,21 +257,36 @@ def worker(args):
         activation = torch.randn(tokens, groups, inner, device=args.device, dtype=torch.bfloat16)
         q, sx = torch_npu.npu_dynamic_quant(activation.view(tokens * groups, inner), dst_type=torch.int8)
         q, sx = q.view(tokens, groups, inner), sx.view(tokens, groups)
-        prequantized = {
-            "composition": lambda: qbmm_reference(q, weight, sx, sw, activation.dtype),
-            "v1": PreparedTQBMM(q, weight, sx, sw, output_dtype=activation.dtype, **v1_options()),
-            "v2_no_prefetch": PreparedTQBMMV2(q, weight, sx, sw, config=control),
-            "v2": PreparedTQBMMV2(q, weight, sx, sw, config=config),
-        }
-        dynamic_plans = {
-            "v1": PreparedDynamicWoA(weight, sw, **v1_options()),
-            "v2_no_prefetch": PreparedDynamicWoAV2(weight, sw, config=control),
-            "v2": PreparedDynamicWoAV2(weight, sw, config=config),
-        }
-        dynamic = {"composition": lambda: dynamic_qbmm_reference(activation, weight, sw)}
-        dynamic.update({name: lambda plan=plan: plan(activation) for name, plan in dynamic_plans.items()})
+        layout_metadata = {}
+        if args.layout_abcd:
+            prequantized, packed = layout_cases(
+                q, weight, sx, sw, activation.dtype, config, qbmm_reference, torch_npu.npu_quant_matmul, PreparedTQBMMV2
+            )
+            dynamic = {}
+            layout_metadata = {
+                "packed_weight_stride": list(packed.stride()),
+                "packed_weight_format": torch_npu.get_npu_format(packed),
+                "scope": "G=1 prequantized only; B/D share packed ND weight; A retains copies and stack",
+            }
+        else:
+            prequantized = {
+                "composition": lambda: qbmm_reference(q, weight, sx, sw, activation.dtype),
+                "v1": PreparedTQBMM(q, weight, sx, sw, output_dtype=activation.dtype, **v1_options()),
+                "v2_no_prefetch": PreparedTQBMMV2(q, weight, sx, sw, config=control),
+                "v2": PreparedTQBMMV2(q, weight, sx, sw, config=config),
+            }
+            dynamic_plans = {
+                "v1": PreparedDynamicWoA(weight, sw, **v1_options()),
+                "v2_no_prefetch": PreparedDynamicWoAV2(weight, sw, config=control),
+                "v2": PreparedDynamicWoAV2(weight, sw, config=config),
+            }
+            dynamic = {"composition": lambda: dynamic_qbmm_reference(activation, weight, sw)}
+            dynamic.update({name: lambda plan=plan: plan(activation) for name, plan in dynamic_plans.items()})
+        domains = {"prequantized": prequantized}
+        if dynamic:
+            domains["including_quant"] = dynamic
         correctness = {}
-        for domain, functions in (("prequantized", prequantized), ("including_quant", dynamic)):
+        for domain, functions in domains.items():
             expected = functions["composition"]()
             for name, function in functions.items():
                 actual = function()
@@ -226,6 +306,8 @@ def worker(args):
                         golden = ((integer.float() * sw_cpu[group, col]) * sx_cpu[row, group]).to(activation.dtype)
                         torch.testing.assert_close(actual_cpu[row, group, col], golden, rtol=0, atol=0)
         # Dynamic bindings must read changed data, not cached activation ptrs.
+        if args.layout_abcd:
+            check_layout_graphs(torch, prequantized, q)
         for name, function in dynamic.items():
             function()
             torch.npu.synchronize()
@@ -244,21 +326,29 @@ def worker(args):
             del captured, graph
             print(f"Changed-input graph check passed: {name}", flush=True)
         timings = {}
-        if not args.check_only:
+        profiles = {}
+        if args.profile_metric:
+            from profile_tqbmm import capture_layout_graph
+
+            expected = prequantized["composition"]()
+            for name in dict.fromkeys(args.profile_cases or LAYOUT_CASES):
+                case_dir = args.output / f"T{tokens}-seed{args.seeds[0]}" / name
+                profiles[name] = capture_layout_graph(
+                    torch, torch_npu.profiler, prequantized[name], expected, name, case_dir, args
+                )
+        elif not args.check_only:
             modes = ("eager", "graph") if args.timing_mode == "both" else (args.timing_mode,)
             for mode in modes:
                 args.current_mode = mode
-                timings[mode] = {
-                    domain: measure(functions, args, elapsed_ms)
-                    for domain, functions in (("prequantized", prequantized), ("including_quant", dynamic))
-                }
+                timings[mode] = {domain: measure(functions, args, elapsed_ms) for domain, functions in domains.items()}
         return {
             "v2_experiment": "passed",
             "T": tokens,
             "seed": args.seeds[0],
             "shape_T_G_K_N": [tokens, groups, inner, columns],
             "weight_stride": list(weight.stride()),
-            "v1": v1_options(),
+            **({"layout_abcd": layout_metadata} if args.layout_abcd else {"v1": v1_options()}),
+            **({"profiles": profiles} if args.profile_metric else {}),
             "v2": asdict(config),
             "v2_prefetch_scheme": (
                 "paired full panels"
@@ -293,8 +383,35 @@ def timing_rows(report):
                     "implementation": name,
                     "median_ms": duration,
                     "speedup_vs_composition": durations["composition"] / duration,
-                    "speedup_vs_v1": durations["v1"] / duration,
+                    **(
+                        {"time_over_native_prepacked": duration / durations["native_prepacked"]}
+                        if "native_prepacked" in durations
+                        else {"speedup_vs_v1": durations["v1"] / duration}
+                    ),
                 }
+
+
+def layout_comparisons(report):
+    if "layout_abcd" not in report:
+        return
+    for mode, domains in report["timings"].items():
+        ms = domains["prequantized"]["median_ms"]
+        a, b, c, d = (ms[name] for name in LAYOUT_CASES)
+        yield {
+            "T": report["T"],
+            "seed": report["seed"],
+            "mode": mode,
+            "A_ms": a,
+            "B_ms": b,
+            "C_ms": c,
+            "D_ms": d,
+            "A_over_B": a / b,
+            "C_over_D": c / d,
+            "D_over_B": d / b,
+            "A_over_C": a / c,
+            "A_minus_B_ms": a - b,
+            "D_minus_B_ms": d - b,
+        }
 
 
 def main(argv=None):
@@ -318,12 +435,13 @@ def main(argv=None):
             report = run_worker(command, args.output / "logs" / f"case-{index:03}.log", args.timeout, "v2_experiment")
             payload["reports"].append(report)
             write_json(args.output / "results.json", payload)
-        rows = [row for report in payload["reports"] for row in timing_rows(report)]
-        if rows:
-            with (args.output / "timings.csv").open("x", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-                writer.writeheader()
-                writer.writerows(rows)
+        for filename, extract in (("timings.csv", timing_rows), ("layout_comparison.csv", layout_comparisons)):
+            rows = [row for report in payload["reports"] for row in extract(report)]
+            if rows:
+                with (args.output / filename).open("x", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                    writer.writeheader()
+                    writer.writerows(rows)
         payload["run_status"] = "completed"
     except BaseException as error:
         payload.update(run_status="failed", error=str(error))

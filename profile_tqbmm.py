@@ -19,7 +19,15 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from analyze_tqbmm_profile import make_report, read_source, serialize_bounded
+from analyze_tqbmm_profile import (
+    COUNTER_FIELDS,
+    PIPELINE_TIME_FIELDS,
+    entry,
+    family,
+    make_report,
+    read_source,
+    serialize_bounded,
+)
 from tools.dsv4_a3_wo.runtime_options import internal_format_enabled
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -150,6 +158,104 @@ def run_profile_calls(function, graph, batch_size, replays):
         for _ in range(replays):
             graph.replay()
     return result
+
+
+def metric_field(metric, key):
+    key = key.lower()
+    if metric == "PipeUtilization":
+        return key in (*PIPELINE_TIME_FIELDS, *COUNTER_FIELDS)
+    if metric == "L2Cache":
+        return ("l2" in key or "_cache_" in key) and any(word in key for word in ("hit", "miss", "allocate"))
+    return any(word in key for word in ("_bw", "bandwidth", "_datas", "_bytes", "(kb)", "(mb)", "(gb/s)"))
+
+
+def layout_profile_focus(case_dir, name, metric, calls):
+    """Use one export only. Some CANN builds put PMUs in op_summary, not kernel_details."""
+    best = None
+    best_score = None
+    for pattern in ("kernel_details.csv", "op_summary*.csv"):
+        files = sorted(case_dir.rglob(pattern))
+        if len(files) > 1:
+            raise RuntimeError(f"Ambiguous {pattern} in single-case capture: {files}")
+        if not files:
+            continue
+        source = files[0]
+        agg, _ = read_source(source, extra_counter_filter=lambda key: metric_field(metric, key))
+        target_families = (
+            ("triton_tqbmm",) if name.startswith("v2") else ("native_quant_matmul_candidate", "other_matmul")
+        )
+        target = [(key, stats) for key, stats in agg.names.items() if family(key[0], key[1]) in target_families]
+        covered = sorted({k for _, stats in target for k in stats.counters if metric_field(metric, k)})
+        # Prefer actual target PMU coverage; do not combine overlapping exports.
+        score = (bool(covered), len(covered), sum(s.count for _, s in target))
+        if best_score is not None and score <= best_score:
+            continue
+        total = sum(stats.total_us for stats in agg.names.values())
+        target_calls = sum(stats.count for _, stats in target)
+        ranked = sorted(agg.names.items(), key=lambda pair: -pair[1].total_us)
+        best = {
+            "source": str(source),
+            "case": name,
+            "requested_metric": metric,
+            "logical_calls": calls,
+            "observed_tasks": sum(stats.count for stats in agg.names.values()),
+            "invalid_rows": agg.invalid,
+            "matched_matmul_tasks": target_calls,
+            "requested_fields_on_matmul": covered,
+            "counter_status": "observed" if covered else "not_observed",
+            "sum_device_task_us_per_logical_call": total / calls,
+            "operators": [entry(key, stats, total) for key, stats in ranked[:12]],
+        }
+        best_score = score
+    if best is None:
+        raise RuntimeError(f"No kernel_details.csv or op_summary*.csv: {case_dir}")
+    best["warnings"] = []
+    if best["invalid_rows"] or best["matched_matmul_tasks"] != calls:
+        best["warnings"].append("Check raw task names/counts against logical calls before comparing task sums.")
+    if not best["requested_fields_on_matmul"]:
+        best["warnings"].append(f"No numeric {metric} counters on recognized matmul rows; do not interpret as zero.")
+    return best
+
+
+def capture_layout_graph(torch, profiler, function, expected, name, case_dir, args):
+    """Profile a checked V2/native closure from the same ABCD worker, never its setup."""
+    metric = getattr(profiler.AiCMetrics, args.profile_metric, None)
+    if metric is None:
+        raise RuntimeError(f"torch_npu does not expose AiCMetrics.{args.profile_metric}")
+    case_dir.mkdir(parents=True, exist_ok=False)
+    for _ in range(args.warmup):
+        function()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        for _ in range(args.graph_batch_size):
+            captured = function()
+    for _ in range(GRAPH_WARMUP_REPLAYS):
+        graph.replay()
+    torch.npu.synchronize()
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    torch.npu.synchronize()
+    print(f"Profiling {name}: {args.profile_metric} -> {case_dir}", flush=True)
+    with profiler.profile(
+        activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
+        record_shapes=True,
+        with_stack=False,
+        profile_memory=False,
+        experimental_config=profiler._ExperimentalConfig(
+            profiler_level=profiler.ProfilerLevel.Level1,
+            aic_metrics=metric,
+            data_simplification=False,
+        ),
+        on_trace_ready=profiler.tensorboard_trace_handler(str(case_dir), analyse_flag=True),
+    ):
+        run_profile_calls(function, graph, args.graph_batch_size, args.profile_replays)
+        torch.npu.synchronize()
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+    focus = layout_profile_focus(case_dir, name, args.profile_metric, args.graph_batch_size * args.profile_replays)
+    focus.update(graph_batch_size=args.graph_batch_size, replays=args.profile_replays)
+    write_manifest(case_dir / "focus.json", focus)
+    print(f"{name}: counter_status={focus['counter_status']}, {case_dir / 'focus.json'}", flush=True)
+    return focus
 
 
 def capture_case(args):

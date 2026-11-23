@@ -3,8 +3,10 @@
 
 import pytest
 import torch
+import torch_npu
 
-from tools.dsv4_a3_wo.benchmark_tqbmm import dynamic_qbmm_reference
+from benchmark_tqbmm_v2 import check_layout_graphs, layout_cases
+from tools.dsv4_a3_wo.benchmark_tqbmm import dynamic_qbmm_reference, qbmm_reference
 from vllm_ascend.ops.triton.transpose_quant_batch_matmul_v2 import (
     PreparedDynamicWoAV2,
     PreparedTQBMMV2,
@@ -16,6 +18,24 @@ pytestmark = pytest.mark.skipif(
     not torch.npu.is_available() or get_ascend_device_type() != AscendDeviceType.A3,
     reason="Experimental V2 requires A3 and Triton-Ascend",
 )
+
+
+def test_v2_native_layout_abcd_graph():
+    torch.manual_seed(0)
+    t, k, n = 65, 128, 64
+    q = torch.randint(-8, 9, (t, 1, k), dtype=torch.int8, device="npu")
+    w = torch.randint(-8, 9, (1, n, k), dtype=torch.int8, device="npu").transpose(1, 2)
+    sx = torch.ones((t, 1), dtype=torch.float32, device="npu")
+    sw = torch.ones((1, n), dtype=torch.float32, device="npu")
+    config = V2Config((32, 32, 64), 64, True)
+    cases, packed = layout_cases(
+        q, w, sx, sw, torch.bfloat16, config, qbmm_reference, torch_npu.npu_quant_matmul, PreparedTQBMMV2
+    )
+    assert packed.is_contiguous() and w.data_ptr() != packed.data_ptr()
+    expected = (q[:, 0].cpu().double() @ w[0].cpu().double()).bfloat16().unsqueeze(1)
+    for function in cases.values():
+        torch.testing.assert_close(function().cpu(), expected, atol=0, rtol=0)
+    check_layout_graphs(torch, cases, q)
 
 
 def _run_plan_to_cpu_with_stages(plan):

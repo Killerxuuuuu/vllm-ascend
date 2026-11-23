@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Native/V2 diagnostic contract, no torch or A3 required."""
+
+from unittest.mock import MagicMock, Mock
+
+import pytest
+
+import benchmark_tqbmm_v2 as runner
+import profile_tqbmm as profiling
+
+
+def test_abcd_only_packs_once_and_passes_shared_views():
+    q, w, sx, sw = [MagicMock() for _ in range(4)]
+    w.shape = (1, 128, 64)
+    w.is_contiguous.return_value = False
+    w.stride.return_value = 1
+    native, reference, prepare = Mock(), Mock(), Mock()
+    cases, packed = runner.layout_cases(q, w, sx, sw, "bf16", "config", reference, native, prepare)
+    assert tuple(cases) == runner.LAYOUT_CASES
+    for _ in range(2):
+        for function in cases.values():
+            function()
+    assert prepare.call_args_list[0].args == (q, w, sx, sw)
+    assert prepare.call_args_list[1].args == (q, packed, sx, sw)
+    assert prepare.call_args_list[0].kwargs == prepare.call_args_list[1].kwargs
+    reference.assert_called_with(q, w, sx, sw, "bf16")
+    native.assert_called_with(q[:, 0], packed[0], sw[0], pertoken_scale=sx[:, 0], output_dtype="bf16")
+    native.return_value.unsqueeze.assert_called_with(1)
+    w.contiguous.assert_called_once_with()
+    w.shape = (2, 128, 64)
+    with pytest.raises(ValueError, match="G=1"):
+        runner.layout_cases(q, w, sx, sw, "bf16", "config", reference, native, prepare)
+
+
+def test_profile_worker_preserves_cases_and_separation():
+    base = ["--quant-model", ".", "--output", "unused"]
+    for extra in ([], ["--layout-abcd"], ["--layout-abcd", "--timing-mode", "graph", "--check-only"]):
+        with pytest.raises(SystemExit):
+            runner.parse_args([*base, "--profile-metric", "MemoryAccess", *extra])
+    args = runner.parse_args(
+        [
+            *base,
+            "--layout-abcd",
+            "--timing-mode",
+            "graph",
+            "--profile-metric",
+            "MemoryAccess",
+            "--profile-cases",
+            "native_prepacked",
+            "v2_prepacked",
+            "--profile-replays",
+            "3",
+        ]
+    )
+    worker = runner.parse_args(runner.worker_command(args, 8192, 1)[3:])
+    assert worker.layout_abcd and worker.profile_metric == "MemoryAccess" and worker.profile_replays == 3
+    assert worker.profile_cases == ["native_prepacked", "v2_prepacked"]
+    assert worker.tokens == [8192] and worker.seeds == [1]
+
+
+def test_ratio_denominators_are_native_centered():
+    ms = dict(zip(runner.LAYOUT_CASES, [2, 1, 8, 4]))
+    report = {"T": 8192, "seed": 0, "layout_abcd": {}, "timings": {"graph": {"prequantized": {"median_ms": ms}}}}
+    (row,) = runner.layout_comparisons(report)
+    assert (row["A_over_B"], row["C_over_D"], row["D_over_B"], row["A_over_C"]) == (2, 2, 4, 0.25)
+    packed = list(runner.timing_rows(report))[-1]
+    assert packed["time_over_native_prepacked"] == 4 and "speedup_vs_v1" not in packed
+
+
+def test_focus_prefers_observed_pmu_only_counts_one_export(tmp_path):
+    kernel = "_transpose_quant_batch_matmul_v2_kernel"
+    (tmp_path / "kernel_details.csv").write_text(f"Name,Duration(us),aic_icache_miss_rate\n{kernel},12,0.1\n")
+    (tmp_path / "op_summary_1.csv").write_text(
+        f"Op Name,Task Duration(us),aic_read_main_memory_datas(KB)\n{kernel},12,2048\n{kernel},14,N/A\n"
+    )
+    focus = profiling.layout_profile_focus(tmp_path, "v2_prepacked", "MemoryAccess", 2)
+    assert focus["matched_matmul_tasks"] == focus["observed_tasks"] == 2
+    assert focus["sum_device_task_us_per_logical_call"] == 13
+    assert focus["operators"][0]["family"] == "triton_tqbmm"
+    assert focus["requested_fields_on_matmul"] == ["aic_read_main_memory_datas(KB)"]
+    (counter,) = focus["operators"][0]["counter_call_means"].values()
+    assert counter == {"mean": 2048, "covered_calls": 1}
+    assert profiling.layout_profile_focus(tmp_path, "v2_prepacked", "L2Cache", 2)["counter_status"] == "not_observed"
+
+
+def test_focus_empty_capture_fails(tmp_path):
+    with pytest.raises(RuntimeError, match="No kernel_details"):
+        profiling.layout_profile_focus(tmp_path, "composition", "PipeUtilization", 4)
