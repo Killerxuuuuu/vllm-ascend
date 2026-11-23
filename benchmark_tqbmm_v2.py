@@ -12,6 +12,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from statistics import median
 
+from tools.dsv4_a3_wo.runtime_options import internal_format_enabled
 from tools.dsv4_a3_wo.tune_tqbmm import run_worker, write_json
 
 ROOT = Path(__file__).resolve().parent
@@ -19,6 +20,15 @@ ROOT = Path(__file__).resolve().parent
 
 def v1_options():
     return {"block_shape": (128, 64, 128), "num_stages": 2, "reuse_m": 1, "reuse_n": 2}
+
+
+def configure_internal_format(torch_npu):
+    # On torch_npu 2.10 the Python config is a setter, not a getter.
+    torch_npu.npu.config.allow_internal_format = True
+    enabled = internal_format_enabled(torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT"))
+    if not enabled:
+        raise RuntimeError("V2 benchmark requires ALLOW_INTERNAL_FORMAT=enable, but the runtime reports it disabled")
+    return enabled
 
 
 def parse_args(argv=None):
@@ -152,7 +162,6 @@ def worker(args):
         qbmm_reference,
     )
     from tools.dsv4_a3_wo.qbmm_probe import error_metrics
-    from tools.dsv4_a3_wo.runtime_options import internal_format_enabled
     from vllm_ascend.ops.triton.transpose_quant_batch_matmul import PreparedDynamicWoA, PreparedTQBMM
     from vllm_ascend.ops.triton.transpose_quant_batch_matmul_v2 import (
         PreparedDynamicWoAV2,
@@ -172,7 +181,7 @@ def worker(args):
     if hooks or modules:
         raise RuntimeError(f"Disable memory instrumentation first: {hooks}, {modules}")
     torch.npu.set_device(args.device)
-    torch.npu.config.allow_internal_format = True
+    allow_internal_format = configure_internal_format(torch_npu)
     torch.manual_seed(args.seeds[0])
     config = V2Config(tuple(args.block_shape), args.panel_k, True, args.programs, args.num_stages)
     control = replace(config, prefetch=False)
@@ -261,7 +270,7 @@ def worker(args):
             "memory_placement": "compiler-managed; panels/prefetch do not guarantee physical L1/overlap",
             "torch": torch.__version__,
             "torch_npu": torch_npu.__version__,
-            "allow_internal_format": internal_format_enabled(torch.npu.config.allow_internal_format),
+            "allow_internal_format": allow_internal_format,
             "storage_formats": {"weight": torch_npu.get_npu_format(weight), "q": torch_npu.get_npu_format(q)},
             "correctness": correctness,
             "cpu_sample_check": "passed",

@@ -507,6 +507,26 @@ def runner():
     return module
 
 
+@pytest.mark.parametrize("raw", [b"enable", b"disable"])
+def test_runner_verifies_internal_format_without_reading_write_only_config(runner, raw):
+    writes = []
+
+    class Config:
+        allow_internal_format = property(fset=lambda self, value: writes.append(value))
+
+    def get_option(name):
+        assert name == "ALLOW_INTERNAL_FORMAT"
+        assert writes == [True]
+        return raw
+
+    npu = SimpleNamespace(npu=SimpleNamespace(config=Config()), _C=SimpleNamespace(_npu_getOption=get_option))
+    if raw == b"disable":
+        with pytest.raises(RuntimeError, match="runtime reports it disabled"):
+            runner.configure_internal_format(npu)
+    else:
+        assert runner.configure_internal_format(npu) is True
+
+
 def test_runner_dry_run_and_command_forwarding(runner, tmp_path, capsys):
     options = [
         "--quant-model",
