@@ -18,6 +18,7 @@ from tools.dsv4_a3_wo.tune_tqbmm import run_worker, write_json
 ROOT = Path(__file__).resolve().parent
 LAYOUT_CASES = ("composition", "native_prepacked", "v2", "v2_prepacked")
 MACRO_CASES = ("v2_macro", "v2_macro_prepacked")
+TILE_MAJOR_CASE = "v2_macro_tile_major"
 
 
 def v1_options():
@@ -65,6 +66,11 @@ def parse_args(argv=None):
         help="Add original/packed block-IO kernels to ABCD. BK and stages match the V2 control.",
     )
     parser.add_argument(
+        "--tile-major-weight",
+        action="store_true",
+        help="Add G: compare F with the same macro kernel reading a static tile-major W (setup excluded).",
+    )
+    parser.add_argument(
         "--profile-metric",
         choices=("PipeUtilization", "MemoryAccess", "L2Cache"),
         help="Profile Graph replays instead of timing; requires --layout-abcd --timing-mode graph",
@@ -72,7 +78,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--profile-cases",
         nargs="+",
-        choices=LAYOUT_CASES + MACRO_CASES,
+        choices=(*LAYOUT_CASES, *MACRO_CASES, TILE_MAJOR_CASE),
         help="Default: all enabled layouts in the same worker",
     )
     parser.add_argument("--profile-replays", type=int, default=4)
@@ -87,6 +93,10 @@ def parse_args(argv=None):
         parser.error("--macro-tile requires --layout-abcd, BM/BN in 16,32,64,128 and BK in 32,64,128")
     if not args.macro_tile and any(name in MACRO_CASES for name in args.profile_cases or ()):
         parser.error("Macro profile cases require --macro-tile")
+    if args.tile_major_weight and not args.macro_tile:
+        parser.error("--tile-major-weight requires --macro-tile and --layout-abcd")
+    if TILE_MAJOR_CASE in (args.profile_cases or ()) and not args.tile_major_weight:
+        parser.error(f"{TILE_MAJOR_CASE} requires --tile-major-weight")
     if args.profile_metric and (not args.layout_abcd or args.timing_mode != "graph" or args.check_only):
         parser.error("--profile-metric requires --layout-abcd --timing-mode graph and is separate from --check-only")
     if args.profile_cases and not args.profile_metric:
@@ -157,6 +167,8 @@ def worker_command(args, tokens, seed):
         command.append("--layout-abcd")
     if args.macro_tile:
         command.extend(["--macro-tile", *map(str, args.macro_tile)])
+    if args.tile_major_weight:
+        command.append("--tile-major-weight")
     if args.profile_metric:
         command.extend(["--profile-metric", args.profile_metric, "--profile-replays", str(args.profile_replays)])
         if args.profile_cases:
@@ -320,6 +332,23 @@ def worker(args):
                         num_stages=config.num_stages,
                         output_dtype=activation.dtype,
                     )
+                if args.tile_major_weight:
+                    prequantized[TILE_MAJOR_CASE] = PreparedMacroTQBMMV2(
+                        q,
+                        packed,
+                        sx,
+                        sw,
+                        block_shape=macro_shape,
+                        num_stages=config.num_stages,
+                        output_dtype=activation.dtype,
+                        tile_major_weight=True,
+                    )
+                    bn = macro_shape[1]
+                    layout_metadata["tile_major_weight"] = {
+                        "physical_shape_G_Npanels_K_BN": [groups, (columns + bn - 1) // bn, inner, bn],
+                        "w_row_stride_elements": bn,
+                        "packing_in_timing_or_capture": False,
+                    }
                 layout_metadata.update(
                     macro_shape=macro_shape,
                     macro_schedule="one program per output rectangle",
@@ -479,6 +508,15 @@ def layout_comparisons(report):
                     "F_over_B": ms["v2_macro_prepacked"] / b,
                 }
                 if "v2_macro" in ms
+                else {}
+            ),
+            **(
+                {
+                    "G_tile_major_ms": ms[TILE_MAJOR_CASE],
+                    "F_over_G": ms["v2_macro_prepacked"] / ms[TILE_MAJOR_CASE],
+                    "A_over_G": a / ms[TILE_MAJOR_CASE],
+                }
+                if TILE_MAJOR_CASE in ms
                 else {}
             ),
         }

@@ -340,6 +340,7 @@ def _transpose_quant_batch_matmul_v2_kernel_macro(
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    TILE_MAJOR_W: tl.constexpr = False,
 ):
     # One program owns one output rectangle. Subblocks of this wider dot
     # consume common A rows/B columns, rather than reloading them per small tile.
@@ -349,7 +350,13 @@ def _transpose_quant_batch_matmul_v2_kernel_macro(
     m0 = (pid // ntiles) * BM
     n0 = (pid % ntiles) * BN
     a0 = tl.make_block_ptr(x_ptr + group * SXG, (T, K), (SXT, SXK), (m0, 0), (BM, BK), (1, 0))
-    if SWN == 1:
+    kn_layout: tl.constexpr = TILE_MAJOR_W | (SWN == 1)
+    if TILE_MAJOR_W:
+        # Physical [G, ceil(N/BN), K, BN]. A single K step now spans
+        # BK contiguous rows of BN bytes; the last N tile is zero padded.
+        panel = w_ptr + (group * ntiles + pid % ntiles) * K * BN
+        b0 = tl.make_block_ptr(panel, (K, BN), (BN, 1), (0, 0), (BK, BN), (1, 0))
+    elif SWN == 1:
         b0 = tl.make_block_ptr(w_ptr + group * SWG, (K, N), (SWK, SWN), (0, n0), (BK, BN), (1, 0))
     else:
         # Physical [N,K] view: the contiguous dimension is last on both input DMAs.
@@ -363,7 +370,7 @@ def _transpose_quant_batch_matmul_v2_kernel_macro(
             a = tl.load(ap)
         else:
             a = tl.load(ap, boundary_check=(0, 1), padding_option="zero")
-        if SWN == 1:
+        if kn_layout:
             bp = tl.advance(b0, (k0, 0))
         else:
             bp = tl.advance(b0, (0, k0))
@@ -371,7 +378,7 @@ def _transpose_quant_batch_matmul_v2_kernel_macro(
             b = tl.load(bp)
         else:
             b = tl.load(bp, boundary_check=(0, 1), padding_option="zero")
-        if SWN != 1:
+        if not kn_layout:
             b = tl.trans(b)
         acc = tl.dot(a, b, acc, out_dtype=tl.int32)
 
@@ -389,10 +396,44 @@ def _transpose_quant_batch_matmul_v2_kernel_macro(
         tl.store(address, result.to(y_ptr.dtype.element_ty), mask=(rows[:, None] < T) & (cols[None, :] < N))
 
 
-class PreparedMacroTQBMMV2(PreparedTQBMM):
-    """Opt-in A3 experiment: regular 2D block IO, one wide accumulator, independent output tiles."""
+def _pack_macro_weight(weight, bn):
+    """Snapshot logical INT8 W[G,K,N] as contiguous [G,ceil(N/BN),K,BN] panels."""
+    groups, inner, columns = weight.shape
+    full, tail = divmod(columns, bn)
+    panels = full + int(tail != 0)
+    # Allocate base format, including for a transposed/sliced source. Even a
+    # single panel must own its storage: later source updates cannot change it.
+    packed = weight.new_empty((groups * panels * inner * bn,)).reshape(groups, panels, inner, bn)
+    if full:
+        source = weight[:, :, : full * bn].reshape(groups, inner, full, bn).swapaxes(1, 2)
+        packed[:, :full].copy_(source)
+    if tail:
+        packed[:, full, :, :tail].copy_(weight[:, :, full * bn :])
+        packed[:, full, :, tail:].zero_()
+    return packed
 
-    def __init__(self, x, weight, sx, sw, *, block_shape, num_stages, output_dtype=torch.bfloat16, out=None):
+
+class PreparedMacroTQBMMV2(PreparedTQBMM):
+    """Fixed-buffer macro plan. tile_major_weight snapshots W once, outside launch/capture.
+
+    Rebuild that opt-in plan when weights change. X and scales still refer to live buffers.
+    """
+
+    def __init__(
+        self,
+        x,
+        weight,
+        sx,
+        sw,
+        *,
+        block_shape,
+        num_stages,
+        output_dtype=torch.bfloat16,
+        out=None,
+        tile_major_weight=False,
+    ):
+        if type(tile_major_weight) is not bool:
+            raise TypeError("tile_major_weight must be bool")
         if len(block_shape) != 3:
             raise ValueError("Macro kernel requires (BM,BN,BK)")
         validate_v2_options(block_shape, block_shape[2], False, 0)
@@ -404,12 +445,19 @@ class PreparedMacroTQBMMV2(PreparedTQBMM):
         # make_block_ptr offsets are signed i32; the backing addresses and strides are not.
         if max(x.shape[0], x.shape[2], weight.shape[2], self._grid[0]) > (1 << 31) - max(block_shape):
             raise ValueError("Macro tile indices exceed the signed 32-bit block pointer offset range")
+        object.__setattr__(self, "_tile_major_weight", tile_major_weight)
+        if tile_major_weight:
+            packed = _pack_macro_weight(weight, block_shape[1])
+            if torch_npu.get_npu_format(packed) not in (0, 2):
+                raise ValueError("Macro weight panels require ND storage")
+            x_arg, _, *rest = self._arguments
+            object.__setattr__(self, "_arguments", (x_arg, packed, *rest))
 
     def __call__(self):
         if not self._empty:
             bm, bn, bk = self._block_shape
             _transpose_quant_batch_matmul_v2_kernel_macro[self._grid](
-                *self._arguments, BM=bm, BN=bn, BK=bk, num_stages=self._num_stages
+                *self._arguments, BM=bm, BN=bn, BK=bk, TILE_MAJOR_W=self._tile_major_weight, num_stages=self._num_stages
             )
         return self.output
 

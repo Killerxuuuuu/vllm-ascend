@@ -34,14 +34,26 @@ def test_v2_native_layout_abcd_graph():
     )
     assert packed.is_contiguous() and w.data_ptr() != packed.data_ptr()
     expected = (q[:, 0].cpu().double() @ w[0].cpu().double()).bfloat16().unsqueeze(1)
+    cases["tile_major"] = PreparedMacroTQBMMV2(
+        q, packed, sx, sw, block_shape=(32, 32, 64), num_stages=2, tile_major_weight=True
+    )
     for function in cases.values():
         torch.testing.assert_close(function().cpu(), expected, atol=0, rtol=0)
     check_layout_graphs(torch, cases, q)
 
 
 @pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("shape", [(128, 1, 4096, 128), (131, 2, 129, 133)])
-def test_macro_exact_bf16_with_offsets_and_tails(shape, packed):
+@pytest.mark.parametrize(
+    "shape,bk,tile_major",
+    [
+        ((128, 1, 4096, 128), 64, False),
+        ((131, 2, 129, 133), 64, False),
+        ((128, 1, 4096, 256), 128, True),
+        ((131, 2, 129, 133), 128, True),
+        ((1, 1, 32, 33), 128, True),
+    ],
+)
+def test_macro_exact_bf16_with_offsets_and_tails(shape, packed, bk, tile_major):
     t, g, k, n = shape
     gen = torch.Generator().manual_seed(19)
     x = torch.randint(-128, 128, (t, g, k + 2), dtype=torch.int8, generator=gen)
@@ -55,8 +67,16 @@ def test_macro_exact_bf16_with_offsets_and_tails(shape, packed):
     if packed:
         weight = weight.contiguous()
     plan = PreparedMacroTQBMMV2(
-        x.npu()[:, :, 1:-1], weight, sx.npu(), sw.npu(), block_shape=(128, 128, 64), num_stages=2
+        x.npu()[:, :, 1:-1],
+        weight,
+        sx.npu(),
+        sw.npu(),
+        block_shape=(128, 128, bk),
+        num_stages=2,
+        tile_major_weight=tile_major,
     )
+    if tile_major:
+        weight.zero_()  # The plan must read the independent snapshot, even for one N panel.
     torch.testing.assert_close(plan().cpu(), golden, rtol=0, atol=0)
 
 

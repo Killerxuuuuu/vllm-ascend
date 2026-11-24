@@ -295,3 +295,26 @@ profiler 存在测量开销，最终加速结论仍以关闭 profiler 的 benchm
 可与 `reuse_m=2` 组合。公共接口及整网默认值不变。
 新入口 `autotune_tqbmm_data_reuse.py` 自动对照旧/宽 N 分块及两轴复用的 32 个候选。
 完整方法、资源边界和服务器指令见 [双向复用实验](../../TQBMM_TWO_AXIS_REUSE.md)。
+
+## 7. A3 macro：对照 W 的块内行距
+
+`benchmark_tqbmm_v2.py` 的 `--tile-major-weight` 只增加实验 G，不改变整网分发。
+F (`v2_macro_prepacked`) 读取连续的整张 W；G (`v2_macro_tile_major`) 在创建 plan 时把同一张 W
+复制为连续的 `[G, ceil(N/BN), K, BN]` 面板，仅在 N 尾部补零。
+逻辑上 `panel[g,j,k,i] = W[g,k,j*BN+i]`（有效列）；块内行距从 N 变为 BN。
+权重快照要随权重更新重建；额外空间为 `G * ceil(N/BN) * K * BN` 字节。
+对照复用相同的激活、scale、宏分块和累加顺序，计时不含打包和动态量化。
+
+```bash
+# QUANT_MODEL 指向现有 INT8 模型；RUN 为可写的新实验父目录。
+opts=(--quant-model "$QUANT_MODEL" --layout-abcd --macro-tile 128 128 --tile-major-weight
+      --block-shape 64 64 128 --panel-k 128 --num-stages 2 --timing-mode graph --tokens 8192)
+python benchmark_tqbmm_v2.py "${opts[@]}" --seeds 0 1 --output "$RUN/timing"
+python benchmark_tqbmm_v2.py "${opts[@]}" --seeds 0 --output "$RUN/pipe" \
+  --profile-metric PipeUtilization --profile-cases v2_macro_prepacked v2_macro_tile_major native_prepacked
+```
+
+每次先做严格数值、CPU 抽样和更换输入的 Graph 回放检查。`layout_comparison.csv` 中，
+`F_over_G > 1` 表示块内连续优于旧 macro，`A_over_G > 1` 才表示超过拼接基线。
+对照各 case 的 `focus.json` 中的 kernel、MTE2、MTE1 和 MAC 耗时；不要相加，也不要把这些
+硬件计数当成逐条 WAIT 的时长。仿真仍按同名 macro kernel 采集，只单独运行所要观察的绑定。

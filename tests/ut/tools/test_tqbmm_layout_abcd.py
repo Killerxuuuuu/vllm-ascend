@@ -92,6 +92,22 @@ def test_macro_operand_byte_prediction():
     assert wide["logical_dots"] == 32768 and wide["acc_bytes_per_tile"] == 64 * 1024
 
 
+def test_tile_major_is_opt_in_and_compares_against_same_macro():
+    base = ["--quant-model", ".", "--output", "unused", "--layout-abcd", "--timing-mode", "graph"]
+    macro = ["--macro-tile", "128", "128"]
+    profile = ["--profile-metric", "PipeUtilization", "--profile-cases", runner.TILE_MAJOR_CASE]
+    for extra in (["--tile-major-weight"], [*macro, *profile]):
+        with pytest.raises(SystemExit):
+            runner.parse_args([*base, *extra])
+    args = runner.parse_args([*base, *macro, "--tile-major-weight", *profile])
+    worker = runner.parse_args(runner.worker_command(args, 8192, 0)[3:])
+    assert worker.tile_major_weight and worker.profile_cases == [runner.TILE_MAJOR_CASE]
+    ms = dict(zip((*runner.LAYOUT_CASES, *runner.MACRO_CASES, runner.TILE_MAJOR_CASE), [8, 1, 9, 4, 6, 4, 2]))
+    report = {"T": 8192, "seed": 0, "layout_abcd": {}, "timings": {"graph": {"prequantized": {"median_ms": ms}}}}
+    (row,) = runner.layout_comparisons(report)
+    assert (row["G_tile_major_ms"], row["F_over_G"], row["A_over_G"]) == (2, 2, 4)
+
+
 def test_focus_prefers_observed_pmu_only_counts_one_export(tmp_path):
     kernel = "_transpose_quant_batch_matmul_v2_kernel"
     (tmp_path / "kernel_details.csv").write_text(f"Name,Duration(us),aic_icache_miss_rate\n{kernel},12,0.1\n")

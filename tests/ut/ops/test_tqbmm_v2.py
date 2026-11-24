@@ -108,9 +108,10 @@ def load_kernels(language):
     return load_kernel_namespace(language)["_transpose_quant_batch_matmul_v2_kernel"]
 
 
-@pytest.mark.parametrize("shape", [(128, 1, 128, 128), (131, 2, 129, 71), (7, 1, 4096, 35)])
+@pytest.mark.parametrize("shape", [(128, 1, 256, 256), (131, 2, 129, 133), (7, 1, 4096, 35)])
 @pytest.mark.parametrize("packed", [False, True])
-def test_macro_addresses_traffic_and_integer_golden(shape, packed):
+@pytest.mark.parametrize("tile_major", [False, True])
+def test_macro_addresses_traffic_and_integer_golden(shape, packed, tile_major):
     t, g, k, n = shape
     bm, bn, bk = 128, 128, 64
     rng = np.random.default_rng(17)
@@ -120,6 +121,10 @@ def test_macro_addresses_traffic_and_integer_golden(shape, packed):
     w = w_buf[:, :, 1:-1].transpose(0, 2, 1)
     if packed:
         w_buf = w = w.copy(order="C")
+    if tile_major:
+        nt = Language.cdiv(n, bn)
+        # Independent physical layout oracle, including N padding in the last panel.
+        w_buf = np.pad(w, ((0, 0), (0, 0), (0, nt * bn - n))).reshape(g, k, nt, bn).swapaxes(1, 2).copy(order="C")
     sx = rng.random((t, g), dtype=np.float32)
     sw = rng.random((g, n), dtype=np.float32)
     y = np.full((t, g, n), np.nan, dtype=np.float32)
@@ -153,7 +158,7 @@ def test_macro_addresses_traffic_and_integer_golden(shape, packed):
             super().store(pointer, value, mask)
 
     pointers = [
-        Pointer(storage, (view.ctypes.data - storage.ctypes.data) // view.itemsize)
+        Pointer(storage, 0 if tile_major and view is w else (view.ctypes.data - storage.ctypes.data) // view.itemsize)
         for view, storage in ((x, x_buf), (w, w_buf), (sx, sx), (sw, sw), (y, y))
     ]
     strides = tuple(s // v.itemsize for v in (x, w, sx, sw) for s in v.strides)
@@ -161,11 +166,11 @@ def test_macro_addresses_traffic_and_integer_golden(shape, packed):
     for group in range(g):
         for pid in range(mt * nt):
             kernel = load_kernel_namespace(BlockLanguage(pid, group))["_transpose_quant_batch_matmul_v2_kernel_macro"]
-            kernel(*pointers, t, g, k, n, *strides, bm, bn, bk)
+            kernel(*pointers, t, g, k, n, *strides, bm, bn, bk, tile_major)
     golden = np.einsum("tgk,gkn->tgn", x.astype(np.int64), w.astype(np.int64))
     np.testing.assert_array_equal(y, (golden.astype(np.float32) * sw[None]) * sx[:, :, None])
     np.testing.assert_array_equal(writes, 1)
-    assert reads == {"x": x.size * nt, "w": w.size * mt}
+    assert reads == {"x": x.size * nt, "w": (w_buf.size if tile_major else w.size) * mt}
 
 
 @pytest.mark.parametrize("block_shape", [(16, 32, 32), (32, 32, 64), (64, 16, 128), (128, 64, 128)])
@@ -390,7 +395,14 @@ def v2_host(host):
         if isinstance(node, (ast.Assign, ast.ClassDef))
         or (
             isinstance(node, ast.FunctionDef)
-            and node.name in ("validate_v2_options", "_v2_programs", "_launch_v2", "transpose_quant_batch_matmul_v2")
+            and node.name
+            in (
+                "validate_v2_options",
+                "_v2_programs",
+                "_launch_v2",
+                "_pack_macro_weight",
+                "transpose_quant_batch_matmul_v2",
+            )
         )
     ]
     exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(SOURCE), "exec"), namespace)
@@ -404,7 +416,7 @@ def test_macro_fixed_plan_grid_and_layout_guards(host):
     plan = module.PreparedMacroTQBMMV2(x, w, sx, sw, **options)
     assert plan() is plan.output
     assert backend.launches[-1][0] == (2, 2)
-    assert backend.launches[-1][2] == dict(BM=128, BN=128, BK=64, num_stages=2)
+    assert backend.launches[-1][2] == dict(BM=128, BN=128, BK=64, TILE_MAJOR_W=False, num_stages=2)
     for x_stride, w_stride in [((260, 130, 2), w.stride()), (x.stride(), (5000, 2, 130))]:
         with pytest.raises(ValueError, match="Macro block IO"):
             module.PreparedMacroTQBMMV2(
@@ -417,6 +429,60 @@ def test_macro_fixed_plan_grid_and_layout_guards(host):
     empty = host_stubs.inputs(backend, tokens=0)
     assert module.PreparedMacroTQBMMV2(*empty, **options)().shape == (0, 2, 33)
     assert len(backend.launches) == 1
+
+
+def test_macro_weight_snapshot_only_at_binding(host, monkeypatch):
+    module, backend = v2_host(host)
+    x, w, sx, sw = host_stubs.inputs(backend)
+    packed = backend.tensor((2, 2, 65, 32), "i8")
+    copies = []
+
+    def pack(source, bn):
+        copies.append((source, bn))
+        return packed
+
+    monkeypatch.setattr(module, "_pack_macro_weight", pack)
+    opts = dict(block_shape=(32, 32, 64), num_stages=2)
+    with pytest.raises(TypeError, match="tile_major_weight"):
+        module.PreparedMacroTQBMMV2(x, w, sx, sw, **opts, tile_major_weight=1)
+    plan = module.PreparedMacroTQBMMV2(x, w, sx, sw, **opts, tile_major_weight=True)
+    for _ in range(2):
+        assert plan() is plan.output
+        assert backend.launches[-1][1][1] is packed
+        assert backend.launches[-1][2]["TILE_MAJOR_W"] is True
+    assert copies == [(w, 32)]
+    packed.fmt = 29
+    with pytest.raises(ValueError, match="ND storage"):
+        module.PreparedMacroTQBMMV2(x, w, sx, sw, **opts, tile_major_weight=True)
+
+
+@pytest.mark.parametrize("n", [1, 32, 64, 69])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_macro_pack_matches_physical_panels(host, n, transposed):
+    module, _ = v2_host(host)
+
+    class HostArray(np.ndarray):
+        def new_empty(self, shape):
+            return np.full(shape, -1, dtype=self.dtype).view(HostArray)
+
+        def copy_(self, value):
+            self[...] = value
+
+        def zero_(self):
+            self.fill(0)
+
+    g, k, bn = 2, 65, 32
+    rng = np.random.default_rng(0)
+    w = rng.integers(-128, 128, (g, n, k + 2), dtype=np.int8)[:, :, 1:-1].swapaxes(1, 2)
+    if not transposed:
+        w = w.copy(order="C")
+    packed = module._pack_macro_weight(w.view(HostArray), bn)
+    assert packed.shape == (g, (n + bn - 1) // bn, k, bn)
+    assert not np.shares_memory(packed, w) and packed.flags.c_contiguous
+    for panel in range(packed.shape[1]):
+        valid = min(bn, n - panel * bn)
+        np.testing.assert_array_equal(packed[:, panel, :, :valid], w[:, :, panel * bn : panel * bn + valid])
+        assert not packed[:, panel, :, valid:].any()
 
 
 def test_fixed_and_dynamic_v2_contracts(host):
