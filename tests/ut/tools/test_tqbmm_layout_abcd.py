@@ -3,10 +3,54 @@
 
 from unittest.mock import MagicMock, Mock
 
+import numpy as np
 import pytest
 
 import benchmark_tqbmm_v2 as runner
 import profile_tqbmm as profiling
+
+
+@pytest.mark.parametrize("stale_replay", [None, "zero", "restored"])
+def test_layout_graph_checks_both_replays_on_host_and_restores_input(stale_replay):
+    torch = MagicMock()
+    q = Mock(spec=["cpu", "zero_", "copy_"])
+    golden = np.array([0, 7], dtype=np.float32)
+    zeros = np.zeros_like(golden)
+    ref, captured = (Mock(spec=["cpu"]) for _ in range(2))
+    ref.cpu.return_value = golden
+    captured.cpu.side_effect = [
+        golden if stale_replay == "zero" else zeros,
+        zeros if stale_replay == "restored" else golden,
+    ]
+    cases = {"composition": Mock(side_effect=[ref, None, captured])}  # reference, warmup, capture
+    torch.zeros_like.side_effect = np.zeros_like
+
+    def assert_exact(actual, expected, *, rtol, atol):
+        assert rtol == atol == 0
+        np.testing.assert_array_equal(actual, expected)
+
+    torch.testing.assert_close = assert_exact
+    original = np.array([1, 2], dtype=np.int8)
+    q.cpu.return_value = original
+    if stale_replay:
+        with pytest.raises(AssertionError):
+            runner.check_layout_graphs(torch, cases, q, original_cpu=original)
+        q.cpu.assert_not_called()
+    else:
+        runner.check_layout_graphs(torch, cases, q)
+        q.cpu.assert_called_once_with()
+    q.zero_.assert_called_once_with()
+    q.copy_.assert_called_once_with(original)
+    assert torch.npu.NPUGraph.return_value.replay.call_count == (1 if stale_replay == "zero" else 2)
+
+
+def test_layout_graph_rejects_zero_reference_before_capture():
+    torch = MagicMock()
+    ref = Mock(spec=["cpu"])
+    ref.cpu.return_value = np.zeros(2, dtype=np.float32)
+    with pytest.raises(ValueError, match="nonzero reference"):
+        runner.check_layout_graphs(torch, {"composition": lambda: ref}, Mock())
+    torch.npu.NPUGraph.assert_not_called()
 
 
 def test_abcd_only_packs_once_and_passes_shared_views():

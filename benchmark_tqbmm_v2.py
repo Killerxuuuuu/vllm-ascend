@@ -224,28 +224,30 @@ def layout_cases(q, weight, sx, sw, dtype, config, reference, native, prepare):
     }, packed
 
 
-def check_layout_graphs(torch, functions, q):
-    """Both the zeroed input and the restored input must be visible on replay."""
-    original = q.clone()
-    golden = functions["composition"]()
-    if not golden.any().item():
+def check_layout_graphs(torch, functions, q, *, original_cpu=None):
+    """Replay on the NPU, but keep validation buffers and reductions off the device."""
+    golden_cpu = functions["composition"]().cpu()
+    if not golden_cpu.any().item():
         raise ValueError("Changed-input gate needs a nonzero reference")
+    zero_cpu = torch.zeros_like(golden_cpu)
+    if original_cpu is None:
+        original_cpu = q.cpu()
     for name, function in functions.items():
         function()
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             captured = function()
-        q.zero_()
         try:
+            q.zero_()
             graph.replay()
             torch.npu.synchronize()
-            torch.testing.assert_close(captured, torch.zeros_like(golden), atol=0, rtol=0)
+            torch.testing.assert_close(captured.cpu(), zero_cpu, atol=0, rtol=0)
         finally:
-            q.copy_(original)
+            q.copy_(original_cpu)
         graph.replay()
         torch.npu.synchronize()
-        torch.testing.assert_close(captured, golden, atol=0, rtol=0)
+        torch.testing.assert_close(captured.cpu(), golden_cpu, atol=0, rtol=0)
         del captured, graph
         print(f"Changed-input graph check passed: {name}", flush=True)
 
@@ -307,12 +309,15 @@ def worker(args):
         groups, inner, columns = weight.shape
         tokens = args.tokens[0]
         activation = torch.randn(tokens, groups, inner, device=args.device, dtype=torch.bfloat16)
+        output_dtype = activation.dtype
         q, sx = torch_npu.npu_dynamic_quant(activation.view(tokens * groups, inner), dst_type=torch.int8)
         q, sx = q.view(tokens, groups, inner), sx.view(tokens, groups)
         layout_metadata = {}
         if args.layout_abcd:
+            # Layout cases only consume the quantized activation from here on.
+            del activation
             prequantized, packed = layout_cases(
-                q, weight, sx, sw, activation.dtype, config, qbmm_reference, torch_npu.npu_quant_matmul, PreparedTQBMMV2
+                q, weight, sx, sw, output_dtype, config, qbmm_reference, torch_npu.npu_quant_matmul, PreparedTQBMMV2
             )
             dynamic = {}
             layout_metadata = {
@@ -330,7 +335,7 @@ def worker(args):
                         sw,
                         block_shape=macro_shape,
                         num_stages=config.num_stages,
-                        output_dtype=activation.dtype,
+                        output_dtype=output_dtype,
                     )
                 if args.tile_major_weight:
                     prequantized[TILE_MAJOR_CASE] = PreparedMacroTQBMMV2(
@@ -340,7 +345,7 @@ def worker(args):
                         sw,
                         block_shape=macro_shape,
                         num_stages=config.num_stages,
-                        output_dtype=activation.dtype,
+                        output_dtype=output_dtype,
                         tile_major_weight=True,
                     )
                     bn = macro_shape[1]
@@ -380,6 +385,8 @@ def worker(args):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=False)
                 correctness[f"{domain}/{name}"] = error_metrics(actual, expected)
                 print(f"Strict check passed: {domain}/{name}", flush=True)
+                del actual
+            del expected
         # Independent selected INT64 CPU dots: not just agreement with CANN.
         q_cpu, w_cpu, sx_cpu, sw_cpu = q.cpu(), weight.cpu(), sx.cpu(), sw.cpu()
         sample_rows = sorted({0, tokens // 2, tokens - 1})
@@ -390,11 +397,11 @@ def worker(args):
                 for row in sample_rows:
                     for col in sample_cols:
                         integer = (q_cpu[row, group].long() * w_cpu[group, :, col].long()).sum()
-                        golden = ((integer.float() * sw_cpu[group, col]) * sx_cpu[row, group]).to(activation.dtype)
+                        golden = ((integer.float() * sw_cpu[group, col]) * sx_cpu[row, group]).to(output_dtype)
                         torch.testing.assert_close(actual_cpu[row, group, col], golden, rtol=0, atol=0)
         # Dynamic bindings must read changed data, not cached activation ptrs.
         if args.layout_abcd:
-            check_layout_graphs(torch, prequantized, q)
+            check_layout_graphs(torch, prequantized, q, original_cpu=q_cpu)
         for name, function in dynamic.items():
             function()
             torch.npu.synchronize()
