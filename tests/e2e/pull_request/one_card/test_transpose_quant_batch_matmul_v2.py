@@ -42,6 +42,37 @@ def test_v2_native_layout_abcd_graph():
     check_layout_graphs(torch, cases, q)
 
 
+@pytest.mark.parametrize("t,g,k,n", [(128, 1, 4096, 256), (129, 2, 1024, 133)])
+def test_macro_l0_pair_exact_and_changed_replay(t, g, k, n):
+    gen = torch.Generator().manual_seed(31)
+    x = torch.randint(-128, 128, (t, g, k), dtype=torch.int8, generator=gen)
+    w = torch.randint(-128, 128, (g, n, k), dtype=torch.int8, generator=gen)
+    sx, sw = torch.rand(t, g, generator=gen), torch.rand(g, n, generator=gen)
+    acc = torch.bmm(x.transpose(0, 1).double(), w.transpose(1, 2).double()).transpose(0, 1)
+    golden = ((acc.float() * sw[None]) * sx[:, :, None]).bfloat16()
+    q = x.npu()
+    plan = PreparedMacroTQBMMV2(
+        q,
+        w.npu().transpose(1, 2),
+        sx.npu(),
+        sw.npu(),
+        block_shape=(128, 128, 128),
+        num_stages=2,
+        tile_major_weight=True,
+    )
+    h = plan.bind_l0_pair()
+    torch.testing.assert_close(h().cpu(), golden, rtol=0, atol=0)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        out = h()
+    q.zero_()
+    graph.replay()
+    torch.testing.assert_close(out.cpu(), torch.zeros_like(golden), rtol=0, atol=0)
+    q.copy_(x)
+    graph.replay()
+    torch.testing.assert_close(out.cpu(), golden, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize(
     "shape,bk,tile_major",

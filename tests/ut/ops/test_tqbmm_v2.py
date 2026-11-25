@@ -108,12 +108,15 @@ def load_kernels(language):
     return load_kernel_namespace(language)["_transpose_quant_batch_matmul_v2_kernel"]
 
 
-@pytest.mark.parametrize("shape", [(128, 1, 256, 256), (131, 2, 129, 133), (7, 1, 4096, 35)])
+@pytest.mark.parametrize(
+    "shape,bk",
+    [((128, 1, 256, 256), 64), ((131, 2, 129, 133), 64), ((7, 1, 4096, 35), 64), ((131, 2, 1024, 133), 512)],
+)
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("tile_major", [False, True])
-def test_macro_addresses_traffic_and_integer_golden(shape, packed, tile_major):
+def test_macro_addresses_traffic_and_integer_golden(shape, bk, packed, tile_major):
     t, g, k, n = shape
-    bm, bn, bk = 128, 128, 64
+    bm = bn = 128
     rng = np.random.default_rng(17)
     x_buf = rng.integers(-128, 128, (t, g, k + 2), dtype=np.int8)
     x = x_buf[:, :, 1:-1]
@@ -454,6 +457,28 @@ def test_macro_weight_snapshot_only_at_binding(host, monkeypatch):
     packed.fmt = 29
     with pytest.raises(ValueError, match="ND storage"):
         module.PreparedMacroTQBMMV2(x, w, sx, sw, **opts, tile_major_weight=True)
+
+
+def test_l0_pair_shares_every_buffer_and_grid_but_changes_dot(host, monkeypatch):
+    module, backend = v2_host(host)
+    t, g, k, n = 129, 1, 1024, 128
+    x = backend.tensor((t, g, k), "i8")
+    w = backend.tensor((g, k, n), "i8")
+    sx, sw = backend.tensor((t, g), "f32"), backend.tensor((g, n), "f32")
+    packed = backend.tensor((g, 1, k, n), "i8")
+    monkeypatch.setattr(module, "_pack_macro_weight", lambda *_: packed)
+    opts = dict(block_shape=(128, 128, 128), num_stages=2)
+    plan = module.PreparedMacroTQBMMV2(x, w, sx, sw, tile_major_weight=True, **opts)
+    h = plan.bind_l0_pair()
+    assert not backend.launches
+    assert plan() is h() is plan.output
+    (grid_g, args_g, g_opts), (grid_h, args_h, h_opts) = backend.launches
+    assert grid_g == grid_h and args_g == args_h and args_h[1] is packed
+    assert g_opts["BK"] == 128 and h_opts == g_opts | {"BK": 512}
+    with pytest.raises(ValueError, match="tile-major"):
+        module.PreparedMacroTQBMMV2(x, w, sx, sw, **opts).bind_l0_pair()
+    with pytest.raises(ValueError, match="divisible"):
+        module.PreparedMacroTQBMMV2(*host_stubs.inputs(backend), tile_major_weight=True, **opts).bind_l0_pair()
 
 
 @pytest.mark.parametrize("n", [1, 32, 64, 69])

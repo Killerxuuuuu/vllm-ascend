@@ -333,3 +333,57 @@ find "$RUN" -name focus.json -print
   若仍接近 1048576，先查生成的 IR 是否重复读取 A/B，不再上调 stages。流水计数器不能相加。
 - 若 128×128 首次编译报片上存储不足，保留报错，改测 `--macro-tile 64 128`（预测 768 MiB）；
   不放宽数值容差，不把失败配置计入性能表。
+
+## H：在一次宽 K dot 内测试 MTE1 与 Cube 的重叠
+
+G 的一次模拟中，上一条 MMAD 在 234034 ns 结束，下一组 MTE1 LOAD 在 234084 ns 开始；
+MTE1 在 234239 ns 发出给 Cube 的信号，Cube 的 WAIT 在 234240 ns 结束。
+因此此处有约 50 ns 在首条 LOAD 之前，155 ns 在首条 LOAD 到发信号之间；155 ns 是经过时间，不是某一条 LOAD 的耗时。
+
+在 BiShengIR 的 `bishengir/lib/Template/lib/Cube/LocalMmad.cpp` 中，
+INT8、128×128 的理论 L0 子块宽度为 `(64 KiB / 2) / 128 = 256`。
+H 把交给同一次 `tl.dot` 的 K 改为 512，让该模板有机会在内部交替装入两个 K=256 的子块。
+K=4096 时，每个输出 tile 的源码 dot 数从 32 降为 8。这个数不是硬件 MMAD 指令数。
+H 与 G 复用同一个 tile-major 权重快照、输入、输出、grid 和 stages=2，串行执行；不做第二份权重打包。
+H 只接受 K 为 512 的倍数，不更改业务默认路径。同步和物理缓冲仍由服务器安装的编译器生成。
+
+### 正确性和无 profiler 计时
+
+在容器内单独使用一张空闲 A3 卡，不启动 vLLM 服务。以下命令在同一个 Bash 终端执行：
+
+```bash
+cd /home/x50063292/vllm-ascend
+RUN=$(mktemp -d /home/x50063292/tqbmm-l0-pair.XXXXXX)
+MODEL=/mnt/share/outputs/dsv4-0731-w8a8-int8-with-wo-20261103-024433
+AB=(--l0-panel-ab --quant-model "$MODEL" --device npu:0 --layer 0 --tp-size 8 --tp-rank 0
+    --tokens 8192 --timing-mode graph --graph-batch-size 4 --timeout 1800)
+
+timeout -k 15s 10m python -m pytest -qx \
+  tests/e2e/pull_request/one_card/test_transpose_quant_batch_matmul_v2.py -k l0_pair \
+  && python -u benchmark_tqbmm_v2.py "${AB[@]}" --seeds 0 1 --warmup 10 --iterations 60 --repeats 8 \
+       --output "$RUN/time" \
+  && cat "$RUN/time/layout_comparison.csv"
+```
+
+两个 seed 都看 `G_over_H`（新方案相对旧方案）与 `A_over_H`（相对拼接）；大于 1 为 H 更快。
+`H_over_B` 是 H 耗时除以原生预打包耗时，越小越好。计时前必须通过全输出严格检查、CPU 点积抽查及改输入回放。
+如编译报片上内存不足，或严格检查失败，保留 `time/logs/` 或 pytest 的首个错误，不把 H 记作通过。
+
+### 计时后单独采 PMU 或模拟
+
+```bash
+python -u benchmark_tqbmm_v2.py "${AB[@]}" --seeds 0 --profile-metric PipeUtilization \
+  --profile-cases native_prepacked v2_macro_tile_major v2_macro_l0_pair --profile-replays 4 --output "$RUN/pipe"
+find "$RUN/pipe" -name focus.json -print
+
+for CASE in G H; do
+  msprof op simulator --soc-version=Ascend910_9382 --core-id=0 --launch-count=1 \
+    --kernel-name=_transpose_quant_batch_matmul_v2_kernel_macro --output="$RUN/sim-$CASE" \
+    "$(command -v python)" -m tools.dsv4_a3_wo.simulate_l0_pair "$CASE" || break
+done
+```
+
+两个模拟进程分别只提交一次目标 kernel。对照同一 Cube core、同一输出 tile 的稳态区间：
+看下一块的 L1→L0 LOAD 是否在当前 MMAD **结束前**开始，结合目标缓冲地址和成对 SET/WAIT 确认依赖。
+按相同 K 工作量比较等待时间和 MMAD 占比，不要比较两张图上单条指令的宽度。
+如果 H 更快但没有新的重叠，记录性能收益，不把收益归因于 L0 双缓冲。

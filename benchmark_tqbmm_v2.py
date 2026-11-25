@@ -19,6 +19,8 @@ ROOT = Path(__file__).resolve().parent
 LAYOUT_CASES = ("composition", "native_prepacked", "v2", "v2_prepacked")
 MACRO_CASES = ("v2_macro", "v2_macro_prepacked")
 TILE_MAJOR_CASE = "v2_macro_tile_major"
+L0_PAIR_CASE = "v2_macro_l0_pair"
+L0_AB_CASES = ("composition", "native_prepacked", TILE_MAJOR_CASE, L0_PAIR_CASE)
 
 
 def v1_options():
@@ -71,6 +73,11 @@ def parse_args(argv=None):
         help="Add G: compare F with the same macro kernel reading a static tile-major W (setup excluded).",
     )
     parser.add_argument(
+        "--l0-panel-ab",
+        action="store_true",
+        help="Focused A/B/G/H experiment. G and H share tile-major W, X, scales and output; H submits a K=512 dot.",
+    )
+    parser.add_argument(
         "--profile-metric",
         choices=("PipeUtilization", "MemoryAccess", "L2Cache"),
         help="Profile Graph replays instead of timing; requires --layout-abcd --timing-mode graph",
@@ -78,13 +85,24 @@ def parse_args(argv=None):
     parser.add_argument(
         "--profile-cases",
         nargs="+",
-        choices=(*LAYOUT_CASES, *MACRO_CASES, TILE_MAJOR_CASE),
+        choices=(*LAYOUT_CASES, *MACRO_CASES, TILE_MAJOR_CASE, L0_PAIR_CASE),
         help="Default: all enabled layouts in the same worker",
     )
     parser.add_argument("--profile-replays", type=int, default=4)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.l0_panel_ab:
+        if args.num_stages != 2 or args.macro_tile or args.layout_abcd or args.tile_major_weight:
+            parser.error("--l0-panel-ab is a standalone A/B/G/H mode with fixed macro tiles and stages=2")
+        if any(getattr(args, name) != parser.get_default(name) for name in ("block_shape", "panel_k", "programs")):
+            parser.error("--l0-panel-ab fixes G/H scheduling; do not supply V2 persistent tuning options")
+        if set(args.profile_cases or ()) - set(L0_AB_CASES):
+            parser.error("--l0-panel-ab only profiles A/B/G/H")
+        args.layout_abcd = True
+        args.tile_major_weight = True
+    elif L0_PAIR_CASE in (args.profile_cases or ()):
+        parser.error(f"{L0_PAIR_CASE} requires --l0-panel-ab")
     if args.macro_tile and (
         not args.layout_abcd
         or any(size not in (16, 32, 64, 128) for size in args.macro_tile)
@@ -93,7 +111,7 @@ def parse_args(argv=None):
         parser.error("--macro-tile requires --layout-abcd, BM/BN in 16,32,64,128 and BK in 32,64,128")
     if not args.macro_tile and any(name in MACRO_CASES for name in args.profile_cases or ()):
         parser.error("Macro profile cases require --macro-tile")
-    if args.tile_major_weight and not args.macro_tile:
+    if args.tile_major_weight and not (args.macro_tile or args.l0_panel_ab):
         parser.error("--tile-major-weight requires --macro-tile and --layout-abcd")
     if TILE_MAJOR_CASE in (args.profile_cases or ()) and not args.tile_major_weight:
         parser.error(f"{TILE_MAJOR_CASE} requires --tile-major-weight")
@@ -142,14 +160,8 @@ def worker_command(args, tokens, seed):
         str(args.tp_size),
         "--tp-rank",
         str(args.tp_rank),
-        "--block-shape",
-        *map(str, args.block_shape),
-        "--panel-k",
-        str(args.panel_k),
         "--num-stages",
         str(args.num_stages),
-        "--programs",
-        str(args.programs),
         "--warmup",
         str(args.warmup),
         "--iterations",
@@ -161,13 +173,26 @@ def worker_command(args, tokens, seed):
         "--timing-mode",
         args.timing_mode,
     ]
+    if not args.l0_panel_ab:
+        command.extend(
+            [
+                "--block-shape",
+                *map(str, args.block_shape),
+                "--panel-k",
+                str(args.panel_k),
+                "--programs",
+                str(args.programs),
+            ]
+        )
     if args.check_only:
         command.append("--check-only")
-    if args.layout_abcd:
+    if args.l0_panel_ab:
+        command.append("--l0-panel-ab")
+    elif args.layout_abcd:
         command.append("--layout-abcd")
     if args.macro_tile:
         command.extend(["--macro-tile", *map(str, args.macro_tile)])
-    if args.tile_major_weight:
+    if args.tile_major_weight and not args.l0_panel_ab:
         command.append("--tile-major-weight")
     if args.profile_metric:
         command.extend(["--profile-metric", args.profile_metric, "--profile-replays", str(args.profile_replays)])
@@ -208,7 +233,7 @@ def source_hashes():
     return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in names}
 
 
-def layout_cases(q, weight, sx, sw, dtype, config, reference, native, prepare):
+def layout_cases(q, weight, sx, sw, dtype, config, reference, native, prepare, *, native_only=False):
     """Pack once. B's 2-D weight is a view of D's 3-D allocation, not another copy."""
     if weight.shape[0] != 1 or weight.is_contiguous() or weight.stride(1) != 1:
         raise ValueError("ABCD requires G=1 and the original noncontiguous transposed [G,K,N] weight")
@@ -216,12 +241,14 @@ def layout_cases(q, weight, sx, sw, dtype, config, reference, native, prepare):
     q2, w2, sx1, sw1 = q[:, 0], packed[0], sx[:, 0], sw[0]
     if not all(tensor.is_contiguous() for tensor in (q2, w2, sx1, sw1)):
         raise ValueError("Native B requires contiguous input/scale views; no hidden packing")
-    return {
+    cases = {
         "composition": lambda: reference(q, weight, sx, sw, dtype),
         "native_prepacked": lambda: native(q2, w2, sw1, pertoken_scale=sx1, output_dtype=dtype).unsqueeze(1),
-        "v2": prepare(q, weight, sx, sw, config=config, output_dtype=dtype),
-        "v2_prepacked": prepare(q, packed, sx, sw, config=config, output_dtype=dtype),
-    }, packed
+    }
+    if not native_only:
+        cases["v2"] = prepare(q, weight, sx, sw, config=config, output_dtype=dtype)
+        cases["v2_prepacked"] = prepare(q, packed, sx, sw, config=config, output_dtype=dtype)
+    return cases, packed
 
 
 def check_layout_graphs(torch, functions, q, *, original_cpu=None):
@@ -282,6 +309,8 @@ def worker(args):
     from tools.dsv4_a3_wo.qbmm_probe import error_metrics
     from vllm_ascend.ops.triton.transpose_quant_batch_matmul import PreparedDynamicWoA, PreparedTQBMM
     from vllm_ascend.ops.triton.transpose_quant_batch_matmul_v2 import (
+        L0_PAIR_CONTROL_TILE,
+        L0_PAIR_PANEL_K,
         PreparedDynamicWoAV2,
         PreparedMacroTQBMMV2,
         PreparedTQBMMV2,
@@ -317,7 +346,16 @@ def worker(args):
             # Layout cases only consume the quantized activation from here on.
             del activation
             prequantized, packed = layout_cases(
-                q, weight, sx, sw, output_dtype, config, qbmm_reference, torch_npu.npu_quant_matmul, PreparedTQBMMV2
+                q,
+                weight,
+                sx,
+                sw,
+                output_dtype,
+                config,
+                qbmm_reference,
+                torch_npu.npu_quant_matmul,
+                PreparedTQBMMV2,
+                native_only=args.l0_panel_ab,
             )
             dynamic = {}
             layout_metadata = {
@@ -325,7 +363,28 @@ def worker(args):
                 "packed_weight_format": torch_npu.get_npu_format(packed),
                 "scope": "G=1 prequantized only; B/D share packed ND weight; A retains copies and stack",
             }
-            if args.macro_tile:
+            if args.l0_panel_ab:
+                g_plan = PreparedMacroTQBMMV2(
+                    q,
+                    packed,
+                    sx,
+                    sw,
+                    block_shape=L0_PAIR_CONTROL_TILE,
+                    num_stages=2,
+                    output_dtype=output_dtype,
+                    tile_major_weight=True,
+                )
+                prequantized[TILE_MAJOR_CASE] = g_plan
+                prequantized[L0_PAIR_CASE] = g_plan.bind_l0_pair()
+                layout_metadata.update(
+                    scope="A/B/G/H prequantized; G/H share input, tile-major snapshot, scales, output and grid",
+                    macro_control_shape=L0_PAIR_CONTROL_TILE,
+                    h_dot_k=L0_PAIR_PANEL_K,
+                    num_stages=2,
+                    predicted_g=tile_cost(tokens, groups, inner, columns, *L0_PAIR_CONTROL_TILE),
+                    predicted_h=tile_cost(tokens, groups, inner, columns, *L0_PAIR_CONTROL_TILE[:2], L0_PAIR_PANEL_K),
+                )
+            elif args.macro_tile:
                 macro_shape = (*args.macro_tile, config.block_shape[2])
                 for name, operand in zip(MACRO_CASES, (weight, packed)):
                     prequantized[name] = PreparedMacroTQBMMV2(
@@ -443,14 +502,23 @@ def worker(args):
             "weight_stride": list(weight.stride()),
             **({"layout_abcd": layout_metadata} if args.layout_abcd else {"v1": v1_options()}),
             **({"profiles": profiles} if args.profile_metric else {}),
-            "v2": asdict(config),
-            "v2_prefetch_scheme": (
-                "paired full panels"
-                if tokens % config.block_shape[0] == columns % config.block_shape[1] == inner % config.panel_k == 0
-                else "paired direct dot-width loads"
+            **(
+                {}
+                if args.l0_panel_ab
+                else {
+                    "v2": asdict(config),
+                    "v2_prefetch_scheme": (
+                        "paired full panels"
+                        if tokens % config.block_shape[0]
+                        == columns % config.block_shape[1]
+                        == inner % config.panel_k
+                        == 0
+                        else "paired direct dot-width loads"
+                    ),
+                    "persistent_cores": prequantized["v2"]._cores,
+                    "logical_accumulator_bytes": config.block_shape[0] * config.block_shape[1] * 4,
+                }
             ),
-            "persistent_cores": prequantized["v2"]._cores,
-            "logical_accumulator_bytes": config.block_shape[0] * config.block_shape[1] * 4,
             "memory_placement": "compiler-managed; panels/prefetch do not guarantee physical L1/overlap",
             "torch": torch.__version__,
             "torch_npu": torch_npu.__version__,
@@ -490,6 +558,21 @@ def layout_comparisons(report):
         return
     for mode, domains in report["timings"].items():
         ms = domains["prequantized"]["median_ms"]
+        if L0_PAIR_CASE in ms:
+            a, b, g, h = (ms[name] for name in L0_AB_CASES)
+            yield {
+                "T": report["T"],
+                "seed": report["seed"],
+                "mode": mode,
+                "A_ms": a,
+                "B_ms": b,
+                "G_ms": g,
+                "H_ms": h,
+                "G_over_H": g / h,
+                "A_over_H": a / h,
+                "H_over_B": h / b,
+            }
+            continue
         a, b, c, d = (ms[name] for name in LAYOUT_CASES)
         yield {
             "T": report["T"],

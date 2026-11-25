@@ -152,6 +152,35 @@ def test_tile_major_is_opt_in_and_compares_against_same_macro():
     assert (row["G_tile_major_ms"], row["F_over_G"], row["A_over_G"]) == (2, 2, 4)
 
 
+def test_l0_panel_ab_cases_flags_and_ratios():
+    base = ["--quant-model", ".", "--output", "unused", "--timing-mode", "graph"]
+    mode = ["--l0-panel-ab"]
+    profile = ["--profile-metric", "PipeUtilization", "--profile-cases", runner.TILE_MAJOR_CASE, runner.L0_PAIR_CASE]
+    for invalid in (
+        profile,
+        [*mode, "--layout-abcd"],
+        [*mode, "--num-stages", "1"],
+        [*mode, "--block-shape", "64", "64", "128"],
+        [*mode, "--profile-metric", "MemoryAccess", "--profile-cases", "v2"],
+    ):
+        with pytest.raises(SystemExit):
+            runner.parse_args([*base, *invalid])
+    args = runner.parse_args([*base, *mode, *profile])
+    command = runner.worker_command(args, 8192, 0)
+    assert "--block-shape" not in command and "--programs" not in command
+    worker = runner.parse_args(command[3:])
+    assert worker.l0_panel_ab and worker.layout_abcd and worker.tile_major_weight
+    assert worker.profile_cases == [runner.TILE_MAJOR_CASE, runner.L0_PAIR_CASE]
+    ms = dict(zip(runner.L0_AB_CASES, [4, 2, 8, 5]))
+    report = {"T": 8192, "seed": 0, "layout_abcd": {}, "timings": {"graph": {"prequantized": {"median_ms": ms}}}}
+    (row,) = runner.layout_comparisons(report)
+    assert (row["G_over_H"], row["A_over_H"], row["H_over_B"]) == (8 / 5, 4 / 5, 5 / 2)
+    shape = (8192, 1, 4096, 1024)
+    g, h = (runner.tile_cost(*shape, 128, 128, bk) for bk in (128, 512))
+    assert g["tiles"] == h["tiles"] and g["logical_dots"] == h["logical_dots"] * 4
+    assert g["input_bytes"] == h["input_bytes"]
+
+
 def test_focus_prefers_observed_pmu_only_counts_one_export(tmp_path):
     kernel = "_transpose_quant_batch_matmul_v2_kernel"
     (tmp_path / "kernel_details.csv").write_text(f"Name,Duration(us),aic_icache_miss_rate\n{kernel},12,0.1\n")

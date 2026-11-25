@@ -18,6 +18,10 @@ from vllm_ascend.ops.triton.triton_utils import extract_slice
 MAX_LOGICAL_ACCUMULATOR_BYTES = 64 * 1024
 MAX_PANEL_K = 512
 GROUP_SIZE_M = 4
+# Experimental macro only. For a 128x128 INT8 output tile LocalMmad's
+# 32-KiB half of each L0 operand buffer holds 256 K elements per row.
+L0_PAIR_CONTROL_TILE = (128, 128, 128)
+L0_PAIR_PANEL_K = 512
 
 
 @triton.jit
@@ -453,9 +457,26 @@ class PreparedMacroTQBMMV2(PreparedTQBMM):
             x_arg, _, *rest = self._arguments
             object.__setattr__(self, "_arguments", (x_arg, packed, *rest))
 
+    def bind_l0_pair(self):
+        """H: wider L1 dot (two nominal L0 fragments), same buffers as G.
+
+        Bind once, outside capture/timing. G and H overwrite the same output;
+        serialize calls and consume/snapshot it before launching either again.
+        Physical overlap is determined by the installed backend, not by Triton.
+        """
+        if not self._tile_major_weight or self._block_shape != L0_PAIR_CONTROL_TILE or self._num_stages != 2:
+            raise ValueError("L0 pair requires the tile-major 128x128x128, stages=2 control")
+        inner = self._arguments[0].shape[-1]
+        if inner % L0_PAIR_PANEL_K:
+            raise ValueError(f"L0 pair requires K divisible by {L0_PAIR_PANEL_K}")
+        return lambda: self._run_macro(L0_PAIR_PANEL_K)
+
     def __call__(self):
+        return self._run_macro(self._block_shape[2])
+
+    def _run_macro(self, bk):
         if not self._empty:
-            bm, bn, bk = self._block_shape
+            bm, bn, _ = self._block_shape
             _transpose_quant_batch_matmul_v2_kernel_macro[self._grid](
                 *self._arguments, BM=bm, BN=bn, BK=bk, TILE_MAJOR_W=self._tile_major_weight, num_stages=self._num_stages
             )
